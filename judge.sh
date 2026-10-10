@@ -38,7 +38,7 @@ DATA=${EFFORTLESS_DATA:-${PLUGIN_DATA:-$HOME/.codex/effortless/data}}
 mkdir -p "$DATA" 2>/dev/null
 LOG="$DATA/verdicts.tsv"
 
-LEVELS=(none minimal low medium high xhigh)
+LEVELS=(none minimal low medium high xhigh max ultra)
 idx() { local i; for i in "${!LEVELS[@]}"; do [ "${LEVELS[$i]}" = "$1" ] && { echo "$i"; return; }; done; echo -1; }
 
 if [ "${1:-}" = "--stats" ]; then
@@ -65,6 +65,8 @@ current=""
 [ -n "$transcript" ] && [ -f "$transcript" ] && current=$(grep -oP '"reasoning_effort"\s*:\s*"\K[a-z]+' "$transcript" | tail -1)
 [ -z "$current" ] && current=$(grep -oP '^\s*model_reasoning_effort\s*=\s*"\K[a-z]+' "$HOME/.codex/config.toml" 2>/dev/null | tail -1)
 current=${current:-medium}
+# An effort this script does not know (a new level, say) cannot be compared: stay out of the way.
+if [ "$(idx "$current")" -lt 0 ]; then log "$current" "-" "-" 0 0 "unknown-effort"; exit 0; fi
 
 # "ok", "go", "继续" between two steps keep the effort the work is already on: no judge.
 if [ "${#prompt}" -le 24 ] && grep -qiP '^\s*(ok(ay)?|y(es)?|yep|sure|go( ahead)?|continue|do it|proceed|thanks?|lgtm|好的?|行|可以|继续|是的?|对|嗯|开始吧?|确认|没问题)\s*[.!。！~]*\s*$' <<<"$prompt"; then
@@ -101,10 +103,11 @@ else
   # Each judge sets msg (text holding the verdict JSON, still escaped) and tokens, or returns 1 and
   # sets failed to the step that went wrong.
   judge_codex() {
-    local OFF=() f cwd r tid m usage
+    local OFF=(-c "notify=[]") f cwd r tid m usage
     for f in apps browser_use browser_use_external computer_use code_mode_host goals hooks image_generation multi_agent plugins remote_plugin shell_snapshot shell_tool skill_search sleep_tool tool_suggest unified_exec view_image web_search workspace_dependencies worktrees; do
       OFF+=(--disable "$f")
     done
+    # notify=[]: a notify program from config.toml must not fire on (and see) the judge's turn.
     # An empty working directory keeps project files such as AGENTS.md out of the judge's context.
     cwd="$DATA/judge-cwd"; mkdir -p "$cwd"
     deadline=$(( SECONDS + BUDGET ))
@@ -211,7 +214,7 @@ if [ "$BIAS" != 0 ]; then
   abs=${BIAS#-}; limit=$([ "$abs" = 1 ] && echo 0.65 || echo 0.85)
   if awk -v s="$sure" -v l="$limit" 'BEGIN{exit !(s < l)}'; then
     step=$([ "${BIAS:0:1}" = - ] && echo -1 || echo 1)
-    i=$(( $(idx "$picked") + step )); [ "$i" -lt 2 ] && i=2; [ "$i" -gt 5 ] && i=5
+    i=$(( $(idx "$picked") + step )); [ "$i" -lt 2 ] && i=2; [ "$i" -gt 7 ] && i=7
     picked=${LEVELS[$i]}
   fi
 fi
@@ -225,12 +228,14 @@ if [ "$gap" -eq 0 ]; then
   exit 0
 fi
 
-if [ "$gap" -gt 0 ]; then how="Alt+. 升 ${gap} 档"; else how="Alt+, 降 ${gap#-} 档"; fi
+# Codex Desktop (running its agent in WSL) has no effort shortcut keys: there it is the effort menu.
+if [ -n "$transcript" ] && head -c 4000 "$transcript" 2>/dev/null | grep -q '"originator":"Codex Desktop"'; then how="在输入框旁的推理档位菜单切到 ${picked}"
+elif [ "$gap" -gt 0 ]; then how="按 Alt+. 升 ${gap} 档"; else how="按 Alt+, 降 ${gap#-} 档"; fi
 text="effortless: 建议 ${picked}（当前 ${current}）— ${why}"
 if [ "$MODE" = block ] && [ "$gap" -ge "$BLOCK_GAP" ]; then
   log "$current" "$picked" "$sure" "$ms" "$tokens" "block"
   echo "$key $(date +%s)" > "$DATA/held"
-  printf '{"decision":"block","reason":"%s。按 %s 后直接回车重发（原文还在输入框里，重发会直接放行）。"}\n' "$text" "$how"
+  printf '{"decision":"block","reason":"%s。%s 后直接回车重发（重发会直接放行）。"}\n' "$text" "$how"
 else
   log "$current" "$picked" "$sure" "$ms" "$tokens" "warn"
   printf '{"systemMessage":"%s（%s，对下一条消息生效）"}\n' "$text" "$how"
