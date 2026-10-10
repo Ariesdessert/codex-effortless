@@ -144,6 +144,7 @@ EFFORTLESS_API_MODEL=openai/gpt-5.6-luna      # the model name that endpoint use
 | `EFFORTLESS_API_STYLE` | `chat` | `chat` or `responses` (sent with `store: false`). A URL ending in either path picks the style itself |
 | `EFFORTLESS_API_REASONING` | empty | reasoning effort for the judge model (`none`, `low`, ...) |
 | `EFFORTLESS_API_FORMAT` | `schema` | `schema` (strict JSON schema), `object` (JSON mode), `none` |
+| `EFFORTLESS_API_UA` | `codex` | `codex` calls like Codex CLI (its User-Agent and `originator` header), for relays that only serve Codex; `none` sends neither; anything else is sent as the User-Agent |
 | `EFFORTLESS_FALLBACK` | `codex` | when the API fails: `codex` judges on your login instead; `none` keeps the effort |
 
 The handoff check goes to the same API. On Windows, Codex Desktop started from the Start menu does not see a variable

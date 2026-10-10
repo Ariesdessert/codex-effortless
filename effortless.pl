@@ -70,6 +70,7 @@ my $API_MODEL = S('EFFORTLESS_API_MODEL', 'openai/gpt-5.6-luna');
 my $API_STYLE = S('EFFORTLESS_API_STYLE', 'chat');
 my $API_FORMAT = S('EFFORTLESS_API_FORMAT', 'schema');
 my $API_REASONING = S('EFFORTLESS_API_REASONING', '');
+my $API_UA = S('EFFORTLESS_API_UA', 'codex');        # codex, none, or a User-Agent of your own
 my $FALLBACK = S('EFFORTLESS_FALLBACK', 'codex');
 my $JEV_URL = S('EFFORTLESS_JEV_URL', $ENV{JEV_URL} || 'https://api.typesafe.ai/v1/systemone');
 my $SWAMP_AT = S('EFFORTLESS_SWAMP_AT', 50);
@@ -460,6 +461,18 @@ sub curl_finish {
   return ($code =~ /(\d{3})/ ? $1 : '000', $body);
 }
 
+# The headers that say who is calling. Some relays only serve Codex, so by default the judge calls the way Codex
+# CLI does: its User-Agent (the version from models_cache.json) and its originator header.
+sub api_headers {
+  my @h = ("Authorization: Bearer $API_KEY");
+  return (@h, 'X-Title: codex-effortless') if $API_UA eq 'none';
+  return (@h, "User-Agent: $API_UA") if $API_UA ne 'codex';
+  my $version = (read_json("$CODEX_HOME/models_cache.json") // {})->{client_version} || '0.162.1';
+  my ($os, undef, $release, undef, $arch) = POSIX::uname();
+  $arch = 'aarch64' if $arch eq 'arm64';
+  return (@h, "User-Agent: codex_cli_rs/$version ($os $release; $arch) " . ($ENV{TERM_PROGRAM} || 'unknown'), 'originator: codex_cli_rs');
+}
+
 # Any OpenAI-compatible endpoint: OpenRouter, OpenAI, a relay. Chat Completions or the Responses API.
 sub ask_api {
   my ($jobs, $budget) = @_;
@@ -470,6 +483,7 @@ sub ask_api {
   elsif ($url =~ m{/responses$}) { $style = 'responses' }
   else { $url .= $style eq 'responses' ? '/responses' : '/chat/completions' }
   my @calls;
+  my @headers = api_headers();
   for my $job (@$jobs) {
     my $keys = join ', ', sort keys %{ $job->{schema}{properties} };
     my $system = "$job->{system} Reply with a JSON object with the keys $keys.";
@@ -485,7 +499,7 @@ sub ask_api {
       $body{response_format} = { type => 'json_schema', json_schema => { name => 'verdict', strict => JSON::PP::true, schema => $job->{schema} } } if $API_FORMAT eq 'schema';
       $body{reasoning_effort} = $API_REASONING if $API_REASONING ne '';
     }
-    push @calls, curl_start($url, ["Authorization: Bearer $API_KEY", 'X-Title: codex-effortless'], $JSON->encode(\%body), $budget);
+    push @calls, curl_start($url, \@headers, $JSON->encode(\%body), $budget);
   }
   my @answers;
   for my $i (0 .. $#calls) {

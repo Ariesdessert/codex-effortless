@@ -35,7 +35,7 @@ static class Effortless
     static string Here, CodexHome, Data, LogPath;
     [ThreadStatic] static string Session;
     static readonly Dictionary<string, string> Conf = new Dictionary<string, string>();
-    static string MODE, JUDGE, MODEL, MIN, MAX, API_URL, API_KEY, API_MODEL, API_STYLE, API_FORMAT, API_REASONING, FALLBACK, JEV_URL,
+    static string MODE, JUDGE, MODEL, MIN, MAX, API_URL, API_KEY, API_MODEL, API_STYLE, API_FORMAT, API_REASONING, API_UA, FALLBACK, JEV_URL,
         COLD, HANDOFF_FROM, HANDOFF_SKILL, HANDOFF_AFTER, BAR, UPDATE_CHECK, CODEX;
     static int BIAS, BLOCK_GAP, BUDGET, HANDOFF_EVERY;
     static double SWAMP_AT, COLD_MINUTES, COLD_TOKENS, HOT_AT;
@@ -82,6 +82,7 @@ static class Effortless
         API_STYLE = S("EFFORTLESS_API_STYLE", "chat");
         API_FORMAT = S("EFFORTLESS_API_FORMAT", "schema");
         API_REASONING = S("EFFORTLESS_API_REASONING", "");
+        API_UA = S("EFFORTLESS_API_UA", "codex");
         FALLBACK = S("EFFORTLESS_FALLBACK", "codex");
         JEV_URL = S("EFFORTLESS_JEV_URL", Env("JEV_URL") ?? "https://api.typesafe.ai/v1/systemone");
         SWAMP_AT = D(S("EFFORTLESS_SWAMP_AT", "50"));
@@ -577,12 +578,18 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         try
         {
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            ServicePointManager.Expect100Continue = false;
             var req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "POST";
             req.ContentType = "application/json";
             req.Timeout = timeoutSec * 1000;
             req.ReadWriteTimeout = timeoutSec * 1000;
-            foreach (string h in headers) { int c = h.IndexOf(':'); req.Headers[h.Substring(0, c)] = h.Substring(c + 1).Trim(); }
+            foreach (string h in headers)
+            {
+                int c = h.IndexOf(':');
+                string name = h.Substring(0, c), value = h.Substring(c + 1).Trim();
+                if (name == "User-Agent") req.UserAgent = value; else req.Headers[name] = value;
+            }
             byte[] b = Utf8.GetBytes(body);
             using (Stream s = req.GetRequestStream()) s.Write(b, 0, b.Length);
             using (var res = (HttpWebResponse)req.GetResponse())
@@ -598,6 +605,31 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         catch { return new KeyValuePair<int, string>(0, ""); }
     }
 
+    // The headers that say who is calling. Some relays only serve Codex, so by default the judge calls the way Codex
+    // CLI does: its User-Agent (the version from models_cache.json) and its originator header.
+    static string[] ApiHeaders()
+    {
+        string auth = "Authorization: Bearer " + API_KEY;
+        if (API_UA == "none") return new[] { auth, "X-Title: codex-effortless" };
+        if (API_UA != "codex") return new[] { auth, "User-Agent: " + API_UA };
+        string version = Str(Get(ReadJson(Path.Combine(CodexHome, "models_cache.json")), "client_version")) ?? "0.162.1";
+        // Environment.OSVersion says 6.2 on Windows 10 and 11 without an app manifest; the registry has the real one.
+        Version v = Environment.OSVersion.Version;
+        string os = v.Major + "." + v.Minor + "." + v.Build;
+        try
+        {
+            const string key = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+            object major = Microsoft.Win32.Registry.GetValue(key, "CurrentMajorVersionNumber", null);
+            object minor = Microsoft.Win32.Registry.GetValue(key, "CurrentMinorVersionNumber", null);
+            object build = Microsoft.Win32.Registry.GetValue(key, "CurrentBuildNumber", null);
+            if (major != null && minor != null && build != null) os = major + "." + minor + "." + build;
+        }
+        catch { }
+        string arch = Env("PROCESSOR_ARCHITECTURE") == "ARM64" ? "aarch64" : "x86_64";
+        string term = Env("TERM_PROGRAM") ?? (Env("WT_SESSION") != null ? "WindowsTerminal" : "unknown");
+        return new[] { auth, "User-Agent: codex_cli_rs/" + version + " (Windows " + os + "; " + arch + ") " + term, "originator: codex_cli_rs" };
+    }
+
     // Any OpenAI-compatible endpoint: OpenRouter, OpenAI, a relay. Chat Completions or the Responses API.
     static Answer[] AskApi(Job[] jobs, int budget)
     {
@@ -607,6 +639,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         else url += style == "responses" ? "/responses" : "/chat/completions";
         var answers = new Answer[jobs.Length];
         var errors = new string[jobs.Length];
+        string[] headers = ApiHeaders();
         var threads = new List<Thread>();
         for (int n = 0; n < jobs.Length; n++)
         {
@@ -631,7 +664,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
                     else if (API_FORMAT == "schema") body["response_format"] = Obj("type", "json_schema", "json_schema", Obj("name", "verdict", "strict", true, "schema", job.Schema));
                     if (API_REASONING != "") body["reasoning_effort"] = API_REASONING;
                 }
-                var r = Post(url, new[] { "Authorization: Bearer " + API_KEY, "X-Title: codex-effortless" }, Ser(body), budget);
+                var r = Post(url, headers, Ser(body), budget);
                 if (r.Key != 200) { errors[i] = "http-" + r.Key.ToString("000", Inv); return; }
                 var j = Parse(r.Value);
                 if (j == null) { errors[i] = "reply"; return; }
