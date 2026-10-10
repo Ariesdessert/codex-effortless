@@ -5,12 +5,13 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Quiet        install with what is already set (updates use this)
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Desktop      also turn on Auto in Codex Desktop
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -StatusLine   also show effort, context and limits in the status line
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -AddToPath    also put codex-auto on your user PATH
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall    remove it (settings and log kept; -Purge: those too)
 #
 # Builds effortless.exe from windows\effortless.cs with the C# compiler that comes with Windows (.NET Framework 4),
 # and puts it with effortless.conf in %USERPROFILE%\.codex\effortless, a UserPromptSubmit entry in
-# %USERPROFILE%\.codex\hooks.json, the $effortless skill in %USERPROFILE%\.codex\skills, and codex-auto on your PATH.
-param([switch]$Quiet, [switch]$Desktop, [switch]$StatusLine, [switch]$Uninstall, [switch]$Purge)
+# %USERPROFILE%\.codex\hooks.json, the $effortless skill in %USERPROFILE%\.codex\skills, and codex-auto.cmd in effortless\bin.
+param([switch]$Quiet, [switch]$Desktop, [switch]$StatusLine, [switch]$AddToPath, [switch]$Uninstall, [switch]$Purge)
 $ErrorActionPreference = 'Stop'
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
@@ -55,7 +56,7 @@ if ($Uninstall -or $Purge) {
   if ($userPath -and ($userPath -split ';') -contains $Bin) { [Environment]::SetEnvironmentVariable('Path', (Path-Without $userPath $Bin), 'User') }
   Remove-Item -LiteralPath $Skill, $Bin, (Join-Path $Dest 'bench') -Recurse -Force -ErrorAction SilentlyContinue
   Get-ChildItem -LiteralPath $Dest -Filter 'effortless*.exe' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
-  Remove-Item -LiteralPath (Join-Path $Dest 'judge.ps1'), (Join-Path $Dest 'source') -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $Dest 'judge.ps1'), (Join-Path $Dest 'source'), (Join-Path $Dest 'effortless.cs') -ErrorAction SilentlyContinue
   if ($Purge) { Remove-Item -LiteralPath $Dest -Recurse -Force -ErrorAction SilentlyContinue }
   'codex-effortless uninstalled. (A Codex Desktop that is open keeps Auto until it restarts.)'
   exit 0
@@ -67,7 +68,11 @@ if (-not (Test-Path -LiteralPath $csc)) { $csc = Join-Path $env:WINDIR 'Microsof
 if (-not (Test-Path -LiteralPath $csc)) { throw 'The .NET Framework 4 C# compiler (csc.exe) was not found.' }
 [void](New-Item -ItemType Directory -Force -Path $Dest, $Bin, (Join-Path $Dest 'bench'), $Skill)
 $new = Join-Path $Dest 'effortless.new.exe'
-$out = & $csc /nologo /codepage:65001 /target:exe /optimize "/out:$new" /r:System.Web.Extensions.dll (Join-Path $PSScriptRoot 'windows\effortless.cs') 2>&1
+# Built from a local copy: compiling straight off a network path (such as \\wsl.localhost) looks like a dropper to
+# behaviour-based antivirus.
+$src = Join-Path $Dest 'effortless.cs'
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows\effortless.cs') -Destination $src -Force
+$out = & $csc /nologo /codepage:65001 /target:exe /optimize "/out:$new" /r:System.Web.Extensions.dll $src 2>&1
 if ($LASTEXITCODE -ne 0) { $out; throw 'Building effortless.exe failed.' }
 Get-ChildItem -LiteralPath $Dest -Filter 'effortless.old-*.exe' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 if (Test-Path -LiteralPath $Exe) {
@@ -96,10 +101,11 @@ $save = "@'`n(the handoff)`n'@ | & `"$Exe`" handoff-save"
 $md = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'skills\effortless\SKILL.md'), $Utf8)
 [IO.File]::WriteAllText((Join-Path $Skill 'SKILL.md'), $md.Replace('{{EFFORTLESS}}', $eff).Replace('{{SAVE_EXAMPLE}}', $save), $Utf8)
 
-# codex-auto: the Codex CLI with Auto, on your PATH.
+# codex-auto: the Codex CLI with Auto. Your PATH is changed only with -AddToPath: a script that builds an exe and then
+# edits PATH is what behaviour-based antivirus (Kaspersky's, for one) takes for a trojan, and rolls back.
 [IO.File]::WriteAllText((Join-Path $Bin 'codex-auto.cmd'), "@echo off`r`nrem codex-effortless: the Codex CLI with Auto (every prompt runs at the effort the judge picks).`r`n`"%~dp0..\effortless.exe`" codex %*`r`n", [Text.Encoding]::ASCII)
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-if (-not (($userPath -split ';') -contains $Bin)) {
+if ($AddToPath -and -not (($userPath -split ';') -contains $Bin)) {
   [Environment]::SetEnvironmentVariable('Path', ((@($userPath, $Bin) | Where-Object { $_ }) -join ';'), 'User')
   "Added $Bin to your PATH (new terminals see it)."
 }
@@ -171,7 +177,8 @@ if ($Desktop) { & $Exe desktop on }
 Next:
   1. Trust the hook: start the CLI (codex.cmd if your execution policy blocks codex.ps1) and run /hooks.
      Codex Desktop reads the same %USERPROFILE%\.codex, so it is trusted there too.
-  2. codex-auto (in a new terminal) starts Codex with Auto: every prompt runs at the effort the judge picks.
+  2. codex-auto starts Codex with Auto: every prompt runs at the effort the judge picks. It is
+     $Bin\codex-auto.cmd (add that folder to PATH yourself, or install with -AddToPath).
      Plain codex works too: then the hook says which effort to switch to.
   3. `$effortless in Codex: stats, settings, save mode, handoff and the rest.
 "@

@@ -48,12 +48,16 @@ and trust effortless. Desktop reads the same `%USERPROFILE%\.codex`, so it is tr
 | the program and `effortless.conf` | `~/.codex/effortless` (`effortless.pl`, `judge.sh`) or `%USERPROFILE%\.codex\effortless` (`effortless.exe`) |
 | the hook | a `UserPromptSubmit` entry in `hooks.json` next to them |
 | the `$effortless` skill | `~/.codex/skills/effortless` |
-| `codex-auto` | `~/.local/bin`, or `%USERPROFILE%\.codex\effortless\bin` (added to your user PATH) |
+| `codex-auto` | `~/.local/bin`, or `%USERPROFILE%\.codex\effortless\bin\codex-auto.cmd` (put on your user PATH only with `-AddToPath`) |
 | the status line (if you say yes) | `[tui] status_line` in `config.toml`, backed up first |
 
 Remove it with `install.sh --uninstall` or `install.ps1 -Uninstall` (`--purge` / `-Purge` also delete settings and log).
 On Windows, the hook runs `effortless.exe` directly, so an `AllSigned` or `RemoteSigned` execution policy does not get in
-the way.
+the way. Behaviour-based antivirus can still flag the installer, since it builds an exe and writes into your profile:
+Kaspersky flagged it once as `PDM:Trojan.Win32.Generic` and rolled back the PATH change it made, so editing PATH is now
+opt-in and the build runs from a local copy. Every
+line it runs is in `install.ps1` and `windows\effortless.cs`; read them, and add an exclusion for
+`%USERPROFILE%\.codex\effortless` only if you are satisfied.
 
 ## What you see
 
