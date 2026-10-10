@@ -1,0 +1,7 @@
+# Local verdict logs and judge scratch space
+data/
+*.log
+*.tsv
+# Personal settings with a key in them, if you keep a copy here
+*.local.conf
+.env
