@@ -73,7 +73,8 @@ my $HANDOFF_FROM = S('EFFORTLESS_HANDOFF_FROM', 30);
 my $HANDOFF_EVERY = int(S('EFFORTLESS_HANDOFF_EVERY', 2)) || 2;
 my $HANDOFF_SKILL = S('EFFORTLESS_HANDOFF_SKILL', '');
 my $HANDOFF_AFTER = S('EFFORTLESS_HANDOFF_AFTER', 'continue');   # continue, confirm, copy
-my %HIDE = map { $_ => 1 } grep { length } split /\s*,\s*/, S('EFFORTLESS_HIDE', 'reason');
+# Empty hides nothing: the default (reason) holds only when the setting is not there at all, as in the original.
+my %HIDE = map { $_ => 1 } grep { length } split /\s*,\s*/, S('EFFORTLESS_HIDE', exists $conf{EFFORTLESS_HIDE} ? '' : 'reason');
 my $BAR = S('EFFORTLESS_BAR', 'changes');           # changes, always
 my $UPDATE_CHECK = S('EFFORTLESS_UPDATE_CHECK', 'on');
 my $CODEX = S('EFFORTLESS_CODEX', 'codex');
@@ -521,7 +522,7 @@ sub ask_jev {
   my $sure = $a->{confidence} // $a->{probabilities}{$effort};
   my $tokens = ($j->{usage}{input_tokens} // 0) + ($j->{usage}{output_tokens} // 0);
   return { unsure => 1, tokens => $tokens } if defined $sure && $sure < 0.5;
-  return { effort => $effort, sure => $sure // 0.5, why => defined $sure ? sprintf('%d%% sure', $sure * 100 + 0.5) : '', tokens => $tokens };
+  return { effort => $effort, sure => $sure, why => defined $sure ? sprintf('%d%% sure', $sure * 100 + 0.5) : '', tokens => $tokens };
 }
 sub jev_failure {
   my $c = shift;
@@ -540,7 +541,8 @@ sub parse_verdict {
   my $effort = lc($v->{effort} // '');
   return undef unless grep { $_ eq $effort } @JUDGED;
   my $sure = $v->{sure};
-  $sure = 0.5 unless defined $sure && $sure =~ /^[\d.]+$/ && $sure >= 0 && $sure <= 1;
+  # No confidence stays none, as in the original: a made-up 0.5 would count as a close call and tip the slider.
+  $sure = undef unless defined $sure && $sure =~ /^[\d.]+$/ && $sure >= 0 && $sure <= 1;
   my $why = cut($v->{why} // '', 60);
   $why =~ s/["\\]//g;
   $why =~ s/[.。!！ ]+$//;
@@ -760,14 +762,15 @@ sub hook {
   }
   my $evidence = $handoff_due ? handoff_evidence($t->{users}, $t->{last_assistant}, $prompt, $percent, $cold) : undef;
 
-  my ($block, $r);
+  my ($block, $r, $reason_said);
   if ($routed) {
     # Auto already set this turn's effort (effortless.pl codex, or the Desktop shim on Windows): say what it did.
     $by = $routed->{by} // '-';
     if (($routed->{action} // '') eq 'manual') {
       push @notes, 'effortless: 你手动改了档位，本对话的 Auto 已暂停（你说了算）。输入 $effortless auto 恢复。' unless $st->{manual_said}++;
     } elsif (($routed->{effort} // '') ne ($routed->{previous} // '') && $routed->{effort}) {
-      my $why = (!$HIDE{reason} || ($routed->{action} // q{}) eq q{named}) && $routed->{why} ? ' · ' . judge_name($routed->{by}) . "：$routed->{why}" : '';
+      my $why = (!$HIDE{reason} || ($routed->{action} // q{}) eq q{named}) && $routed->{why} ? ' · ' . reason_line($routed->{by}, $routed->{sure}, $routed->{why}) : '';
+      $reason_said = 1 if $why;
       push @notes, "effortless: 自动切到 $routed->{effort}（原 " . ($routed->{previous} // '?') . "）$why";
     }
     push @notes, "effortless: $routed->{down}" if $routed->{down} && !$st->{warned}{ $routed->{down} }++;
@@ -796,12 +799,13 @@ sub hook {
         log_row($current, '-', '-', $r->{ms}, $r->{tokens}, "fail:$r->{fail}");
       } else {
         my $gap = rank($r->{effort}) - rank($current);
-        my $sure = sprintf('%.2f', $r->{sure});
+        my $sure = defined $r->{sure} ? sprintf('%.2f', $r->{sure}) : '-';
         if ($gap == 0) {
           log_row($current, $r->{effort}, $sure, $r->{ms}, $r->{tokens}, 'same');
         } else {
           my $how = $t->{desktop} ? "在输入框旁的推理档位菜单切到 $r->{effort}" : $gap > 0 ? "按 Alt+. 升 $gap 档" : "按 Alt+, 降 " . (-$gap) . " 档";
-          my $text = "effortless: 建议 $r->{effort}（当前 $current）— " . ($r->{why} || judge_name($r->{by}));
+          my $text = "effortless: 建议 $r->{effort}（当前 $current）— " . reason_line($r->{by}, $r->{sure}, $r->{why});
+          $reason_said = 1;
           if ($MODE ne 'warn' && $gap >= $BLOCK_GAP) {
             log_row($current, $r->{effort}, $sure, $r->{ms}, $r->{tokens}, 'block');
             write_json("$DATA/held", { key => $key, at => now() });
@@ -860,6 +864,9 @@ sub hook {
     push @bar, sprintf('◔ %d%%', $percent + 0.5) if $t->{window};
     push @bar, $cold ? '❄ 缓存已冷' : sprintf('缓存约剩 %d 分钟', $COLD_MINUTES - $idle) if $t->{last_at};
     if (my $top = hottest($t)) { push @bar, sprintf('%s %d%%', limit_name($top->{minutes}), $top->{pct}) }
+    # The judge's line, as the original's bar shows it under the effort, unless a note above already said it.
+    my ($said) = grep { $_ && ($_->{action} // q{}) =~ /^(judged|named)$/ } $routed, $r;
+    push @bar, reason_line($said->{by}, $said->{sure}, $said->{why}) if $said && !$HIDE{reason} && !$reason_said;
     unshift @notes, join(' · ', @bar);
   }
 
@@ -870,6 +877,12 @@ sub hook {
 }
 
 sub judge_name { my $b = shift // q{}; $b eq q{jev} ? q{Jev} : $b eq q{named} ? q{你} : q{Luna} }
+# The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why. Jev's reason already is its confidence.
+sub reason_line {
+  my ($by, $sure, $why) = @_;
+  my $pct = ($by // q{}) ne q{named} && defined $sure && ($why // q{}) !~ /% sure/ ? sprintf(' %d%%', $sure * 100 + 0.5) : q{};
+  return judge_name($by) . $pct . (length($why // q{}) ? "：$why" : q{});
+}
 
 # At most every 6 hours, in the background: is the repo the hook was installed from behind its remote?
 sub check_update_later {
@@ -998,7 +1011,7 @@ sub cmd_test {
   my $prompt = join(' ', @_) || 'rename one variable in a single file';
   $prompt = decode_utf8($prompt);
   my $r = decide(prompt => $prompt, current => 'medium');
-  if ($r->{action} =~ /^(judged|named)$/) { out(sprintf("%s 回答：%s（%.0f%% 把握，%.1f 秒）%s\n", judge_name($r->{by}), $r->{effort}, $r->{sure} * 100, $r->{ms} / 1000, $r->{why} ? " — $r->{why}" : '')) }
+  if ($r->{action} =~ /^(judged|named)$/) { out(sprintf("%s 回答：%s（%s，%.1f 秒）%s\n", judge_name($r->{by}), $r->{effort}, defined $r->{sure} ? sprintf('%.0f%% 把握', $r->{sure} * 100) : '没说把握', $r->{ms} / 1000, $r->{why} ? " — $r->{why}" : '')) }
   else { out('判断失败：' . ($r->{fail} // $r->{action}) . ($r->{down} ? "（$r->{down}）" : '') . "\n"); exit 1 }
 }
 

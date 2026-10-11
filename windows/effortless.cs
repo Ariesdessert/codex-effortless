@@ -80,7 +80,8 @@ static class Effortless
         HANDOFF_EVERY = Math.Max(1, I(S("EFFORTLESS_HANDOFF_EVERY", "2")));
         HANDOFF_SKILL = S("EFFORTLESS_HANDOFF_SKILL", "");
         HANDOFF_AFTER = S("EFFORTLESS_HANDOFF_AFTER", "continue");
-        HIDE = new HashSet<string>(S("EFFORTLESS_HIDE", "reason").Split(',').Select(x => x.Trim()).Where(x => x != ""));
+        // Empty hides nothing: the default (reason) holds only when the setting is not there at all, as in the original.
+        HIDE = new HashSet<string>(S("EFFORTLESS_HIDE", Conf.ContainsKey("EFFORTLESS_HIDE") ? "" : "reason").Split(',').Select(x => x.Trim()).Where(x => x != ""));
         BAR = S("EFFORTLESS_BAR", "changes");
         UPDATE_CHECK = S("EFFORTLESS_UPDATE_CHECK", "on");
         CODEX = S("EFFORTLESS_CODEX", "");
@@ -644,7 +645,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         return m.Success ? m.Groups[1].Value : null;
     }
 
-    class Verdict { public string Effort, Why, Down; public double Sure = 0.5; public bool Unsure; public long Tokens; }
+    class Verdict { public string Effort, Why, Down; public double? Sure; public bool Unsure; public long Tokens; }
 
     // Jev on TypeSafe: quick, and answers with its confidence. Below even odds it is unsure: Luna decides then.
     static Verdict AskJev(string key, string prompt, string current, string context)
@@ -663,7 +664,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         object sure = Get(a, "confidence") ?? Get(a, "probabilities", effort);
         long tokens = (long)(Num(Get(j, "usage", "input_tokens"), 0) + Num(Get(j, "usage", "output_tokens"), 0));
         if (sure != null && Num(sure, 1) < 0.5) return new Verdict { Unsure = true, Tokens = tokens };
-        return new Verdict { Effort = effort, Sure = sure != null ? Num(sure, 0.5) : 0.5, Why = sure != null ? string.Format(Inv, "{0}% sure", (int)(Num(sure, 0) * 100 + 0.5)) : "", Tokens = tokens };
+        return new Verdict { Effort = effort, Sure = sure != null ? Num(sure, 0) : (double?)null, Why = sure != null ? string.Format(Inv, "{0}% sure", (int)(Num(sure, 0) * 100 + 0.5)) : "", Tokens = tokens };
     }
     static string JevFailure(int c)
     {
@@ -686,8 +687,9 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         if (v == null) return null;
         string effort = (Str(Get(v, "effort")) ?? "").ToLowerInvariant();
         if (!JUDGED.Contains(effort)) return null;
-        double sure = Num(Get(v, "sure"), 0.5);
-        if (sure < 0 || sure > 1) sure = 0.5;
+        // No confidence stays none, as in the original: a made-up 0.5 would count as a close call and tip the slider.
+        double? sure = Get(v, "sure") != null ? Num(Get(v, "sure"), -1) : (double?)null;
+        if (sure < 0 || sure > 1) sure = null;
         string why = Regex.Replace(Regex.Replace(Cut(Str(Get(v, "why")) ?? "", 60), "[\"\\\\]", ""), "[.。!！ ]+$", "");
         return new Verdict { Effort = effort, Sure = sure, Why = why };
     }
@@ -701,10 +703,10 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     // ------------------------------------------------------------ picking the effort
 
     // The slider tips close calls only; then the floor and ceiling; save mode caps at medium; then the efforts the model takes.
-    static string ShapeEffort(string effort, double sure, List<string> supported)
+    static string ShapeEffort(string effort, double? sure, List<string> supported)
     {
         int i = Rank(effort);
-        if (BIAS != 0 && sure < (Math.Abs(BIAS) == 1 ? 0.65 : 0.85))
+        if (BIAS != 0 && sure.HasValue && sure.Value < (Math.Abs(BIAS) == 1 ? 0.65 : 0.85))
         {
             i += Math.Sign(BIAS);
             i = Math.Max(Rank("low"), Math.Min(Rank("max"), i));
@@ -750,7 +752,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     class Decision
     {
         public string Effort, Raw, Why, By, Action, Fail, Down, Handoff;
-        public double Sure;
+        public double? Sure;
         public long Ms, Tokens;
         public bool HandoffChecked;
     }
@@ -818,6 +820,19 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         return r;
     }
     static string JudgeName(string b) { return b == "jev" ? "Jev" : b == "named" ? "你" : "Luna"; }
+    // The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why. Jev's reason already is its confidence.
+    static string ReasonLine(string by, double? sure, string why)
+    {
+        string pct = by != "named" && sure.HasValue && !(why ?? "").Contains("% sure") ? string.Format(Inv, " {0}%", (int)(sure.Value * 100 + 0.5)) : "";
+        return JudgeName(by) + pct + (string.IsNullOrEmpty(why) ? "" : "：" + why);
+    }
+    // A confidence read back from JSON: none when it was not written or is out of range.
+    static double? SureOf(object o)
+    {
+        if (o == null) return null;
+        double s = Num(o, -1);
+        return s >= 0 && s <= 1 ? s : (double?)null;
+    }
 
     // ------------------------------------------------------------ the hook
 
@@ -907,6 +922,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
 
         string block = null;
         Decision r = null;
+        bool reasonSaid = false;
         bool noUpdates = info != null && info.Updates is bool && !(bool)info.Updates;
         if (routed != null)
         {
@@ -919,7 +935,8 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             }
             else if (rEffort != null && rEffort != rPrev)
             {
-                string why = (!HIDE.Contains("reason") || Str(Get(routed, "action")) == "named") && !string.IsNullOrEmpty(rWhy) ? " · " + JudgeName(by) + "：" + rWhy : "";
+                string why = (!HIDE.Contains("reason") || Str(Get(routed, "action")) == "named") && !string.IsNullOrEmpty(rWhy) ? " · " + ReasonLine(by, SureOf(Get(routed, "sure")), rWhy) : "";
+                if (why != "") reasonSaid = true;
                 notes.Add("effortless: 自动切到 " + rEffort + "（原 " + (rPrev ?? "?") + "）" + why);
             }
             if (!string.IsNullOrEmpty(rDown) && once(rDown)) notes.Add("effortless: " + rDown);
@@ -951,7 +968,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             {
                 r = Decide(prompt, current, lastUser, t.LastAssistant, percent, info != null ? info.Supported : null, null, evidence, false);
                 if (r.Down != null && once(r.Down)) notes.Add("effortless: " + r.Down);
-                string sure = r.Sure.ToString("0.00", Inv);
+                string sure = r.Sure.HasValue ? r.Sure.Value.ToString("0.00", Inv) : "-";
                 if (r.Action == "follow-up") LogRow(current, "-", "-", 0, 0, "follow-up");
                 else if (r.Action == "fail") LogRow(current, "-", "-", r.Ms, r.Tokens, "fail:" + r.Fail);
                 else
@@ -961,7 +978,8 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
                     else
                     {
                         string how = t.Desktop ? "在输入框旁的推理档位菜单切到 " + r.Effort : gap > 0 ? "按 Alt+. 升 " + gap + " 档" : "按 Alt+, 降 " + (-gap) + " 档";
-                        string text = "effortless: 建议 " + r.Effort + "（当前 " + current + "）— " + (string.IsNullOrEmpty(r.Why) ? JudgeName(r.By) : r.Why);
+                        string text = "effortless: 建议 " + r.Effort + "（当前 " + current + "）— " + ReasonLine(r.By, r.Sure, r.Why);
+                        reasonSaid = true;
                         if (MODE != "warn" && gap >= BLOCK_GAP)
                         {
                             LogRow(current, r.Effort, sure, r.Ms, r.Tokens, "block");
@@ -1028,6 +1046,13 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             if (t.Window > 0) bar.Add(string.Format(Inv, "◔ {0}%", (int)(percent + 0.5)));
             if (t.LastAt > 0) bar.Add(cold ? "❄ 缓存已冷" : string.Format(Inv, "缓存约剩 {0} 分钟", (int)(COLD_MINUTES - idle)));
             if (top != null) bar.Add(string.Format(Inv, "{0} {1}%", LimitName(top.Minutes), (int)top.Pct));
+            // The judge's line, as the original's bar shows it under the effort, unless a note above already said it.
+            if (!HIDE.Contains("reason") && !reasonSaid)
+            {
+                string rAction = routed != null ? Str(Get(routed, "action")) : null;
+                if (rAction == "judged" || rAction == "named") bar.Add(ReasonLine(Str(Get(routed, "by")), SureOf(Get(routed, "sure")), Str(Get(routed, "why"))));
+                else if (r != null && (r.Action == "judged" || r.Action == "named")) bar.Add(ReasonLine(r.By, r.Sure, r.Why));
+            }
             notes.Insert(0, string.Join(" · ", bar));
         }
 
@@ -1247,7 +1272,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     {
         string prompt = a.Length > 0 ? string.Join(" ", a) : "rename one variable in a single file";
         Decision r = Decide(prompt, "medium", null, null, 0, null, null, null, false);
-        if (r.Action == "judged" || r.Action == "named") { Out(string.Format(Inv, "{0} 回答：{1}（{2:0}% 把握，{3:0.0} 秒）{4}\n", JudgeName(r.By), r.Effort, r.Sure * 100, r.Ms / 1000.0, r.Why != "" ? " — " + r.Why : "")); return 0; }
+        if (r.Action == "judged" || r.Action == "named") { Out(string.Format(Inv, "{0} 回答：{1}（{2}，{3:0.0} 秒）{4}\n", JudgeName(r.By), r.Effort, r.Sure.HasValue ? string.Format(Inv, "{0:0}% 把握", r.Sure.Value * 100) : "没说把握", r.Ms / 1000.0, r.Why != "" ? " — " + r.Why : "")); return 0; }
         Out("判断失败：" + (r.Fail ?? r.Action) + (r.Down != null ? "（" + r.Down + "）" : "") + "\n");
         return 1;
     }
