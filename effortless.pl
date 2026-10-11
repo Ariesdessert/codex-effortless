@@ -58,7 +58,7 @@ sub S {
 my $MODE = S('EFFORTLESS_MODE', 'auto');            # auto, warn, block, off
 my $JUDGE = S('EFFORTLESS_JUDGE', 'auto');          # auto, luna, jev
 my $MODEL = S('EFFORTLESS_MODEL', 'gpt-5.6-luna');
-my $MIN = S('EFFORTLESS_MIN', 'low');
+my $MIN = S('EFFORTLESS_MIN', 'medium');
 my $MAX = S('EFFORTLESS_MAX', 'max');
 my $BIAS = int(S('EFFORTLESS_BIAS', 0));
 my $BLOCK_GAP = int(S('EFFORTLESS_BLOCK_GAP', 1));

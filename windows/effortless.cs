@@ -65,7 +65,7 @@ static class Effortless
         MODE = S("EFFORTLESS_MODE", "auto");
         JUDGE = S("EFFORTLESS_JUDGE", "auto");
         MODEL = S("EFFORTLESS_MODEL", "gpt-5.6-luna");
-        MIN = S("EFFORTLESS_MIN", "low");
+        MIN = S("EFFORTLESS_MIN", "medium");
         MAX = S("EFFORTLESS_MAX", "max");
         BIAS = I(S("EFFORTLESS_BIAS", "0"));
         BLOCK_GAP = I(S("EFFORTLESS_BLOCK_GAP", "1"));

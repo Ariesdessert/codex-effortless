@@ -112,7 +112,7 @@ stand and wait instead of carrying on.
 | `EFFORTLESS_MODE` | `auto` | `auto` (`block` is the same), `warn` (only say, never switch or hold back, even through `codex-auto`), `off` |
 | `EFFORTLESS_JUDGE` | `auto` | `auto`: Luna, and Jev first when a TypeSafe key is set. `luna`: never Jev. `jev`: the key may also come from `~/.config/jev/.env` |
 | `EFFORTLESS_MODEL` | `gpt-5.6-luna` | the judge model on your Codex login |
-| `EFFORTLESS_MIN` / `EFFORTLESS_MAX` | `low` / `max` | Auto stays between these; efforts the model does not take are skipped to the nearest one it does |
+| `EFFORTLESS_MIN` / `EFFORTLESS_MAX` | `medium` / `max` | Auto stays between these; efforts the model does not take are skipped to the nearest one it does |
 | `EFFORTLESS_BIAS` | `0` | `-2` to `2`: tips the judge's close calls cheaper or smarter; sure calls stay |
 | `EFFORTLESS_TIMEOUT` | `20` | seconds before the prompt goes on at the effort it had |
 | `EFFORTLESS_COLD` / `_COLD_MINUTES` / `_COLD_TOKENS` | `block` / `30` / `150000` | the cold-chat check (`warn` or `off` instead of holding the prompt) |
