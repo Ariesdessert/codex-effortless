@@ -130,15 +130,8 @@ $cfg = Join-Path $CodexHome 'config.toml'
 if (-not $Quiet) {
   ''
   'Setup (Enter keeps the choice in brackets; change any of it later with $effortless settings):'
-  $j = Read-Host '  Judge: 1 Luna on your Codex login, 2 an OpenAI-compatible API, 3 add Jev (TypeSafe key) [1]'
+  $j = Read-Host '  Judge: 1 Luna on your Codex login, 2 add Jev (TypeSafe key) [1]'
   if ($j -eq '2') {
-    $url = Read-Host '  API base URL (e.g. https://openrouter.ai/api/v1)'
-    $kenv = Read-Host '  Name of the environment variable holding the key, set with setx (e.g. OPENROUTER_API_KEY)'
-    $am = Read-Host '  Model name at that API [openai/gpt-5.6-luna]'
-    if ($url) { & $Exe config set EFFORTLESS_API_URL $url | Out-Null }
-    if ($kenv) { & $Exe config set EFFORTLESS_API_KEY_ENV $kenv | Out-Null }
-    if ($am) { & $Exe config set EFFORTLESS_API_MODEL $am | Out-Null }
-  } elseif ($j -eq '3') {
     $k = Read-Host '  TypeSafe key (not shown; saved in effortless.conf in your profile)' -AsSecureString
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($k))
     if ($plain) { & $Exe config set EFFORTLESS_TYPESAFE_KEY $plain | Out-Null }

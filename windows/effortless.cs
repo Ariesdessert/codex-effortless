@@ -6,7 +6,7 @@
 //   effortless.exe app-server ...   what Codex Desktop starts when CODEX_CLI_PATH points here (effortless desktop on)
 //   effortless.exe desktop on|off   Auto in Codex Desktop
 //   effortless.exe stats | debug | auto [on|off] | save [on|off] | config [set KEY VALUE] | test [prompt]
-//   effortless.exe handoff-save | resume | copy | bench | update | version
+//   effortless.exe handoff-save | resume | handoff-write | copy | bench | update | version
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
@@ -26,7 +26,7 @@ using System.Web.Script.Serialization;
 
 static class Effortless
 {
-    const string VERSION = "0.4.0";
+    const string VERSION = "0.5.0";
     static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     static readonly string[] LEVELS = { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" };
@@ -35,7 +35,7 @@ static class Effortless
     static string Here, CodexHome, Data, LogPath;
     [ThreadStatic] static string Session;
     static readonly Dictionary<string, string> Conf = new Dictionary<string, string>();
-    static string MODE, JUDGE, MODEL, MIN, MAX, API_URL, API_KEY, API_MODEL, API_STYLE, API_FORMAT, API_REASONING, API_UA, FALLBACK, JEV_URL,
+    static string MODE, JUDGE, MODEL, MIN, MAX, JEV_URL,
         COLD, HANDOFF_FROM, HANDOFF_SKILL, HANDOFF_AFTER, BAR, UPDATE_CHECK, CODEX;
     static int BIAS, BLOCK_GAP, BUDGET, HANDOFF_EVERY;
     static double SWAMP_AT, COLD_MINUTES, COLD_TOKENS, HOT_AT;
@@ -70,20 +70,6 @@ static class Effortless
         BIAS = I(S("EFFORTLESS_BIAS", "0"));
         BLOCK_GAP = I(S("EFFORTLESS_BLOCK_GAP", "1"));
         BUDGET = I(S("EFFORTLESS_TIMEOUT", "20"));
-        API_URL = S("EFFORTLESS_API_URL", "");
-        API_KEY = S("EFFORTLESS_API_KEY", "");
-        string keyEnv = S("EFFORTLESS_API_KEY_ENV", "");
-        if (API_KEY == "" && keyEnv != "")
-        {
-            // Codex Desktop started from the Start menu may not see a variable set in one terminal: user variables (setx) count too.
-            API_KEY = Env(keyEnv) ?? Environment.GetEnvironmentVariable(keyEnv, EnvironmentVariableTarget.User) ?? "";
-        }
-        API_MODEL = S("EFFORTLESS_API_MODEL", "openai/gpt-5.6-luna");
-        API_STYLE = S("EFFORTLESS_API_STYLE", "chat");
-        API_FORMAT = S("EFFORTLESS_API_FORMAT", "schema");
-        API_REASONING = S("EFFORTLESS_API_REASONING", "");
-        API_UA = S("EFFORTLESS_API_UA", "codex");
-        FALLBACK = S("EFFORTLESS_FALLBACK", "codex");
         JEV_URL = S("EFFORTLESS_JEV_URL", Env("JEV_URL") ?? "https://api.typesafe.ai/v1/systemone");
         SWAMP_AT = D(S("EFFORTLESS_SWAMP_AT", "50"));
         COLD = S("EFFORTLESS_COLD", "block");
@@ -172,6 +158,8 @@ static class Effortless
         using (var md5 = MD5.Create()) return string.Concat(md5.ComputeHash(Utf8.GetBytes(s)).Select(b => b.ToString("x2"))).Substring(0, 16);
     }
     static string SafeId(string s) { return Regex.Replace(s ?? "", @"[^\w.-]", ""); }
+    // A time kept in the session file: it comes back as a decimal, a hair off the double it was written from.
+    static bool SameTime(object kept, double t) { return Math.Abs(Num(kept, 0) - t) < 0.01; }
 
     static void LogRow(string cur, string verdict, string sure, long ms, long tokens, string action)
     {
@@ -193,6 +181,7 @@ static class Effortless
         public Dictionary<string, string> TurnEffort = new Dictionary<string, string>();
         public List<double[]> Usage = new List<double[]>();   // in, cached, out
         public List<string> UsageTurn = new List<string>();
+        public List<KeyValuePair<string, string>> Msgs = new List<KeyValuePair<string, string>>();   // role, text: with full only
     }
 
     static double IsoTime(string s)
@@ -204,20 +193,22 @@ static class Effortless
     }
 
     // What effortless reads from a session's transcript: the effort and model in use, how full the context is,
-    // when the last answer came, the usage limits, and the messages.
-    static Transcript ReadTranscript(string path)
+    // when the last answer came, the usage limits, and the messages. With full, also every message and tool call in
+    // order (Msgs), for a handoff written from the transcript.
+    static Transcript ReadTranscript(string path, bool full = false)
     {
         var t = new Transcript();
         if (string.IsNullOrEmpty(path) || !File.Exists(path)) return t;
         string text;
         try { text = ReadShared(path); } catch { return t; }
         var type = new Regex("\"type\"\\s*:\\s*\"(turn_context|token_count|message|token_usage_record)\"");
+        var call = new Regex("\"type\"\\s*:\\s*\"[a-z_]*(call|call_output)\"");
         int n = 0;
         foreach (string line in text.Split('\n'))
         {
             n++;
             if (n <= 3 && Regex.IsMatch(line, "\"originator\"\\s*:\\s*\"Codex Desktop\"")) t.Desktop = true;
-            if (!type.IsMatch(line)) continue;
+            if (!type.IsMatch(line) && !(full && call.IsMatch(line))) continue;
             var j = Parse(line) as Dictionary<string, object>;
             if (j == null) continue;
             object p = Get(j, "payload");
@@ -257,11 +248,25 @@ static class Effortless
                     // Codex sends its own context as user messages too: they start with a tag.
                     if (Regex.IsMatch(said, @"^\s*(<[a-z_]+>|# AGENTS\.md)")) continue;
                     t.Users.Add(said);
+                    if (full) t.Msgs.Add(new KeyValuePair<string, string>("user", said));
                 }
-                else if (role == "assistant" && said.Trim() != "" && (Str(Get(p, "phase")) ?? "final_answer") != "commentary")
+                else if (role == "assistant" && said.Trim() != "")
                 {
-                    t.LastAssistant = said;
+                    if ((Str(Get(p, "phase")) ?? "final_answer") != "commentary") t.LastAssistant = said;
+                    if (full) t.Msgs.Add(new KeyValuePair<string, string>("assistant", said));
                 }
+            }
+            else if (full && jt == "response_item" && pt.EndsWith("_call"))
+            {
+                object input = Get(p, "arguments") ?? Get(p, "input") ?? Get(p, "action") ?? "";
+                t.Msgs.Add(new KeyValuePair<string, string>("tool", (Str(Get(p, "name")) ?? pt) + " " + (input is string ? (string)input : Ser(input))));
+            }
+            else if (full && jt == "response_item" && pt.EndsWith("_call_output"))
+            {
+                object o = Get(p, "output") ?? "";
+                if (o is Dictionary<string, object> && Get(o, "content") != null) o = Get(o, "content");
+                if (o is object[] || o is ArrayList) o = string.Join("\n", Arr(o).Select(x => x is string ? (string)x : Str(Get(x, "text")) ?? ""));
+                t.Msgs.Add(new KeyValuePair<string, string>("result", o is string ? (string)o : Ser(o)));
             }
             else if (jt == "token_usage_record")
             {
@@ -279,7 +284,7 @@ static class Effortless
         return t;
     }
 
-    class ModelInfo { public List<string> Supported = new List<string>(); public object Updates; public string Default; }
+    class ModelInfo { public List<string> Supported = new List<string>(); public object Updates; public string Default; public double Window; }
 
     // The models Codex knows, with the efforts each takes (models_cache.json).
     static ModelInfo GetModelInfo(string model)
@@ -289,7 +294,7 @@ static class Effortless
         foreach (object m in Arr(Get(j, "models")))
         {
             if (Str(Get(m, "slug")) != model) continue;
-            var info = new ModelInfo { Updates = Get(m, "supports_reasoning_effort_updates"), Default = Str(Get(m, "default_reasoning_level")) };
+            var info = new ModelInfo { Updates = Get(m, "supports_reasoning_effort_updates"), Default = Str(Get(m, "default_reasoning_level")), Window = Num(Get(m, "context_window"), 0) };
             foreach (object l in Arr(Get(m, "supported_reasoning_levels")))
             {
                 string e = l is string ? (string)l : (Str(Get(l, "effort")) ?? Str(Get(l, "reasoningEffort")));
@@ -392,6 +397,24 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     // A short follow-up such as "go", "ok", "继续" keeps the effort the work is on, unless the last reply ended on a
     // question: then the answer can start a small or a big job, and goes to the judge.
     static readonly Regex FollowRe = new Regex(@"^\s*(ok(ay)?|y(es)?|yep|sure|go( ahead)?|continue|do it|proceed|thanks?|lgtm|好的?|行|可以|继续|是的?|对|嗯|开始吧?|确认|没问题)\s*[.!。！~～]*\s*$", RegexOptions.IgnoreCase);
+    // A level the prompt names ("max effort", "effort: high", "xhigh"), or nothing. The word effort must sit beside the
+    // level, so "a medium sized image" names nothing, and "don't use max effort" is a no. As in the original, a named
+    // level runs without the judge.
+    const string LEVEL_WORD = "(low|medium|high|xhigh|x-high|extra[- ]high|max|maximum)";
+    static readonly Regex NAMED_LEVEL = new Regex(@"\b" + LEVEL_WORD + @"\s+effort\b|\beffort(?:\s+level)?\s*(?:[:=]|to|at|of|on)?\s*" + LEVEL_WORD + @"\b|\bxhigh\b",
+        RegexOptions.IgnoreCase | RegexOptions.ECMAScript);
+    static string NamedEffort(string text)
+    {
+        foreach (Match m in NAMED_LEVEL.Matches(text ?? ""))
+        {
+            string before = text.Substring(Math.Max(0, m.Index - 20), Math.Min(20, m.Index)).ToLowerInvariant();
+            if (Regex.IsMatch(before, @"\b(not|no|don'?t|never|without|instead of)\b", RegexOptions.ECMAScript) || Regex.IsMatch(before, "(不要|不用|别|无需|不必)")) continue;
+            string w = Regex.Replace((m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Success ? m.Groups[2].Value : "xhigh").ToLowerInvariant(), @"\s+", " ");
+            return w == "x-high" || w == "extra high" || w == "extra-high" ? "xhigh" : w == "maximum" ? "max" : w;
+        }
+        return null;
+    }
+
     static bool IsFollowUp(string s)
     {
         string t = (s ?? "").Trim();
@@ -405,7 +428,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
 
     // ------------------------------------------------------------ the judges
 
-    class Job { public string System, Ask; public object Schema; }
+    class Job { public string System, Ask, Effort; public object Schema; }   // no Schema: free text; Effort none unless set
     class Answer { public string Text; public long Tokens; }
 
     // Finds codex.exe: the setting, then PATH, then the npm package, then Codex Desktop's own.
@@ -515,8 +538,9 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
                         else
                         {
                             threadJob[tid] = i;
-                            send(Obj("id", 20 + i, "method", "turn/start", "params", Obj("threadId", tid, "effort", "none", "outputSchema", jobs[i].Schema,
-                                "input", new object[] { Obj("type", "text", "text", "[effortless-judge] " + jobs[i].Ask) })));
+                            var turn = Obj("threadId", tid, "effort", jobs[i].Effort ?? "none", "input", new object[] { Obj("type", "text", "text", "[effortless-judge] " + jobs[i].Ask) });
+                            if (jobs[i].Schema != null) turn["outputSchema"] = jobs[i].Schema;
+                            send(Obj("id", 20 + i, "method", "turn/start", "params", turn));
                         }
                     }
                     else
@@ -578,18 +602,12 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         try
         {
             ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
-            ServicePointManager.Expect100Continue = false;
             var req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "POST";
             req.ContentType = "application/json";
             req.Timeout = timeoutSec * 1000;
             req.ReadWriteTimeout = timeoutSec * 1000;
-            foreach (string h in headers)
-            {
-                int c = h.IndexOf(':');
-                string name = h.Substring(0, c), value = h.Substring(c + 1).Trim();
-                if (name == "User-Agent") req.UserAgent = value; else req.Headers[name] = value;
-            }
+            foreach (string h in headers) { int c = h.IndexOf(':'); req.Headers[h.Substring(0, c)] = h.Substring(c + 1).Trim(); }
             byte[] b = Utf8.GetBytes(body);
             using (Stream s = req.GetRequestStream()) s.Write(b, 0, b.Length);
             using (var res = (HttpWebResponse)req.GetResponse())
@@ -605,99 +623,10 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         catch { return new KeyValuePair<int, string>(0, ""); }
     }
 
-    // The headers that say who is calling. Some relays only serve Codex, so by default the judge calls the way Codex
-    // CLI does: its User-Agent (the version from models_cache.json) and its originator header.
-    static string[] ApiHeaders()
+    // The judge for a set of questions: Luna on your Codex login. Sets by to the judge that answered.
+    static Answer[] AskJudge(Job[] jobs)
     {
-        string auth = "Authorization: Bearer " + API_KEY;
-        if (API_UA == "none") return new[] { auth, "X-Title: codex-effortless" };
-        if (API_UA != "codex") return new[] { auth, "User-Agent: " + API_UA };
-        string version = Str(Get(ReadJson(Path.Combine(CodexHome, "models_cache.json")), "client_version")) ?? "0.162.1";
-        // Environment.OSVersion says 6.2 on Windows 10 and 11 without an app manifest; the registry has the real one.
-        Version v = Environment.OSVersion.Version;
-        string os = v.Major + "." + v.Minor + "." + v.Build;
-        try
-        {
-            const string key = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
-            object major = Microsoft.Win32.Registry.GetValue(key, "CurrentMajorVersionNumber", null);
-            object minor = Microsoft.Win32.Registry.GetValue(key, "CurrentMinorVersionNumber", null);
-            object build = Microsoft.Win32.Registry.GetValue(key, "CurrentBuildNumber", null);
-            if (major != null && minor != null && build != null) os = major + "." + minor + "." + build;
-        }
-        catch { }
-        string arch = Env("PROCESSOR_ARCHITECTURE") == "ARM64" ? "aarch64" : "x86_64";
-        string term = Env("TERM_PROGRAM") ?? (Env("WT_SESSION") != null ? "WindowsTerminal" : "unknown");
-        return new[] { auth, "User-Agent: codex_cli_rs/" + version + " (Windows " + os + "; " + arch + ") " + term, "originator: codex_cli_rs" };
-    }
-
-    // Any OpenAI-compatible endpoint: OpenRouter, OpenAI, a relay. Chat Completions or the Responses API.
-    static Answer[] AskApi(Job[] jobs, int budget)
-    {
-        string url = API_URL.TrimEnd('/'), style = API_STYLE;
-        if (url.EndsWith("/chat/completions")) style = "chat";
-        else if (url.EndsWith("/responses")) style = "responses";
-        else url += style == "responses" ? "/responses" : "/chat/completions";
-        var answers = new Answer[jobs.Length];
-        var errors = new string[jobs.Length];
-        string[] headers = ApiHeaders();
-        var threads = new List<Thread>();
-        for (int n = 0; n < jobs.Length; n++)
-        {
-            int i = n;
-            var t = new Thread(() =>
-            {
-                Job job = jobs[i];
-                string keys = string.Join(", ", ((Dictionary<string, object>)Get(job.Schema, "properties")).Keys.OrderBy(k => k));
-                string system = job.System + " Reply with a JSON object with the keys " + keys + ".";
-                Dictionary<string, object> body;
-                if (style == "responses")
-                {
-                    body = Obj("model", API_MODEL, "max_output_tokens", 400, "store", false, "instructions", system, "input", job.Ask);
-                    if (API_FORMAT == "object") body["text"] = Obj("format", Obj("type", "json_object"));
-                    else if (API_FORMAT == "schema") body["text"] = Obj("format", Obj("type", "json_schema", "name", "verdict", "strict", true, "schema", job.Schema));
-                    if (API_REASONING != "") body["reasoning"] = Obj("effort", API_REASONING);
-                }
-                else
-                {
-                    body = Obj("model", API_MODEL, "max_tokens", 400, "messages", new object[] { Obj("role", "system", "content", system), Obj("role", "user", "content", job.Ask) });
-                    if (API_FORMAT == "object") body["response_format"] = Obj("type", "json_object");
-                    else if (API_FORMAT == "schema") body["response_format"] = Obj("type", "json_schema", "json_schema", Obj("name", "verdict", "strict", true, "schema", job.Schema));
-                    if (API_REASONING != "") body["reasoning_effort"] = API_REASONING;
-                }
-                var r = Post(url, headers, Ser(body), budget);
-                if (r.Key != 200) { errors[i] = "http-" + r.Key.ToString("000", Inv); return; }
-                var j = Parse(r.Value);
-                if (j == null) { errors[i] = "reply"; return; }
-                string text;
-                if (style == "responses")
-                    text = Str(Get(j, "output_text")) ?? string.Concat(Arr(Get(j, "output")).SelectMany(o => Arr(Get(o, "content"))).Where(c => Str(Get(c, "type")) == "output_text").Select(c => Str(Get(c, "text"))));
-                else
-                    text = Str(Get(Arr(Get(j, "choices")).FirstOrDefault(), "message", "content"));
-                answers[i] = new Answer { Text = text ?? "", Tokens = (long)Num(Get(j, "usage", "total_tokens"), 0) };
-            }) { IsBackground = true };
-            t.Start();
-            threads.Add(t);
-        }
-        foreach (Thread t in threads) t.Join((budget + 5) * 1000);
-        string err = errors.FirstOrDefault(e => e != null);
-        if (err != null) failed = err;
-        return answers;
-    }
-
-    // The configured judge for a set of questions: the API when one is set (falling back to Codex), else Codex.
-    static Answer[] AskJudge(Job[] jobs, out string whyDown)
-    {
-        failed = ""; whyDown = null;
-        if (API_URL != "" && API_KEY != "")
-        {
-            by = "api";
-            Answer[] a = AskApi(jobs, BUDGET);
-            if (a.Any(x => x != null)) return a;
-            whyDown = "api:" + failed;
-            LogRow(null, "-", "-", 0, 0, "fail:api:" + failed);
-            if (FALLBACK != "codex") return a;
-            failed = "";
-        }
+        failed = "";
         by = "codex";
         return AskCodex(jobs, BUDGET);
     }
@@ -786,9 +715,15 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         if (hi < lo) hi = lo;
         i = Math.Max(lo, Math.Min(hi, i));
         if (Saving() && i > Rank("medium")) i = Rank("medium");
-        if (supported != null && supported.Count > 0 && !supported.Contains(LEVELS[i]))
+        return FitSupported(LEVELS[i], supported);
+    }
+
+    // The nearest level the model takes, the higher one on a tie.
+    static string FitSupported(string level, List<string> supported)
+    {
+        int i = Rank(level);
+        if (supported != null && supported.Count > 0 && !supported.Contains(level))
         {
-            // The nearest level the model takes, the higher one on a tie.
             int best = -1, dist = int.MaxValue;
             foreach (string s in supported)
             {
@@ -820,8 +755,9 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         public bool HandoffChecked;
     }
 
-    // One prompt through the pipeline every caller shares (the hook, Auto, the bench): a follow-up keeps the effort,
-    // else Jev (when set) and then Luna judge. With handoff evidence, the handoff question goes along with Luna's.
+    // One prompt through the pipeline every caller shares (the hook, Auto, the bench): a level named in the prompt
+    // ("max effort") runs as asked, a follow-up keeps the effort, else Jev (when set) and then Luna judge. With handoff
+    // evidence, the handoff question goes along with Luna's.
     static Decision Decide(string prompt, string current, string lastUser, string lastAssistant, double percent, List<string> supported,
         string attachments, string handoff, bool onlyHandoff)
     {
@@ -831,7 +767,15 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         string context = ContextText(lastUser, lastAssistant);
         string asked = prompt;
         if (!string.IsNullOrEmpty(attachments)) asked += "\n\n[The message comes with " + attachments + " to look at.]";
+        string named = !onlyHandoff && !Regex.IsMatch(prompt, @"^\s*[$/]") ? NamedEffort(prompt) : null;
         if (onlyHandoff) { r.Effort = current; r.Action = "skip"; }
+        else if (named != null)
+        {
+            // The person said the level: it runs past Min, Max and save mode, and no judge is asked.
+            by = r.By = "named";
+            r.Effort = FitSupported(named, supported); r.Raw = named; r.Sure = 1; r.Why = "你点名要的"; r.Action = "named";
+            if (handoff == null) return r;
+        }
         else if (string.IsNullOrEmpty(attachments) && Rank(current) >= 0 && KeepsEffort(prompt, lastAssistant))
         {
             r.Effort = r.Raw = current; r.Sure = 1; r.Why = ""; r.Action = "follow-up";
@@ -851,9 +795,8 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         if (handoff != null) { handoffJob = jobs.Count; jobs.Add(new Job { System = HANDOFF_SYSTEM, Ask = handoff, Schema = HandoffSchema() }); }
         if (jobs.Count > 0)
         {
-            string judgeBy = by, whyDown;
-            Answer[] answers = AskJudge(jobs.ToArray(), out whyDown);
-            if (whyDown != null && effortJob >= 0 && r.Down == null) r.Down = ApiFailure(whyDown);
+            string judgeBy = by;
+            Answer[] answers = AskJudge(jobs.ToArray());
             r.Tokens += answers.Where(a => a != null).Sum(a => a.Tokens);
             if (effortJob >= 0)
             {
@@ -874,19 +817,22 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         r.Effort = r.Action == "judged" ? ShapeEffort(r.Raw, r.Sure, supported) : (r.Effort ?? current);
         return r;
     }
-    static string ApiFailure(string w)
-    {
-        Match m = Regex.Match(w, @"http-(\d+)");
-        string code = m.Success ? m.Groups[1].Value : "000";
-        string what = code == "000" ? "API 没有及时回答" : code == "401" || code == "403" ? "API 拒绝了 key（" + code + "）" : code == "402" ? "API 额度用完了（" + code + "）" : code == "429" ? "API 限流了（" + code + "）" : "API 出错了（" + code + "）";
-        return FALLBACK == "codex" ? what + "，改用 Codex 登录判断" : what;
-    }
-    static string JudgeName(string b) { return b == "jev" ? "Jev" : b == "api" ? "API" : "Luna"; }
+    static string JudgeName(string b) { return b == "jev" ? "Jev" : b == "named" ? "你" : "Luna"; }
 
     // ------------------------------------------------------------ the hook
 
     static string LimitName(double m) { return m == 300 ? "5 小时" : m == 10080 ? "每周" : m % 60 == 0 ? (m / 60).ToString(Inv) + " 小时" : m.ToString(Inv) + " 分钟"; }
     static Limit Hottest(Transcript t) { return t.Limits.Values.OrderByDescending(l => l.Pct).FirstOrDefault(); }
+
+    // Running hot is said once per usage window (its length and reset time), and once more when it passes HOT_FINAL.
+    const double HOT_FINAL = 95;
+    // To the quarter hour: the reset time Codex reports can shift by seconds between turns.
+    static string HotWindow(Limit top) { return top.Minutes.ToString(Inv) + " " + (top.Resets > 0 ? Math.Floor(top.Resets / 900 + 0.5).ToString(Inv) : ""); }
+    static bool HotVisible(Limit top, Dictionary<string, object> said)
+    {
+        if (said == null || Str(Get(said, "window")) != HotWindow(top)) return true;
+        return top.Pct >= HOT_FINAL && Num(Get(said, "pct"), 0) < HOT_FINAL;
+    }
 
     static int Hook()
     {
@@ -919,9 +865,22 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         st["warned"] = warned;
         Func<string, bool> once = k => { if (warned.ContainsKey(k)) return false; warned[k] = 1; return true; };
 
+        // A quick handoff from a cold chat: the chat's model would reread the whole context at full price to write it.
+        // Luna writes it from the transcript instead, in the background, as the original has Haiku do. Sent again in the
+        // same idle spell, the prompt goes through and the chat's model writes it.
+        if (cold && Regex.IsMatch(prompt, @"^\s*\$effortless\s+handoff\s*$", RegexOptions.IgnoreCase) && !SameTime(Get(st, "cold_handoff_for"), t.LastAt) && StartHandoffWriter(tpath))
+        {
+            st["cold_handoff_for"] = t.LastAt;
+            WriteJson(stPath, st);
+            LogRow(current, "-", "-", 0, 0, "cold-handoff");
+            SayJson(Obj("decision", "block", "reason", "effortless: 对话已冷，快速交接改由 " + MODEL + " 在后台从对话记录写，不让当前模型按全价重读约 " + Ktokens(t.Tokens) +
+                " tokens。输入 /new 开新对话，发送 $effortless resume 即可接上（还没写完会稍等）。想让当前模型来写，直接回车重发。"));
+            return 0;
+        }
+
         // A chat gone cold: the next message rereads the whole context at full price. Held back once, so /compact or a
         // handoff can come first; sent again (or anything else sent in the same idle spell), it goes through.
-        if (cold && COLD != "off" && t.Tokens >= COLD_TOKENS && Num(Get(st, "cold_for"), 0) != t.LastAt)
+        if (cold && COLD != "off" && !HIDE.Contains("cold") && t.Tokens >= COLD_TOKENS && !SameTime(Get(st, "cold_for"), t.LastAt))
         {
             string msg = string.Format(Inv, "effortless: 对话已冷（闲置 {0} 分钟），这条消息会按全价重读约 {1} tokens。", (int)idle, Ktokens(t.Tokens));
             if (COLD == "block")
@@ -960,7 +919,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             }
             else if (rEffort != null && rEffort != rPrev)
             {
-                string why = !HIDE.Contains("reason") && !string.IsNullOrEmpty(rWhy) ? " · " + JudgeName(by) + "：" + rWhy : "";
+                string why = (!HIDE.Contains("reason") || Str(Get(routed, "action")) == "named") && !string.IsNullOrEmpty(rWhy) ? " · " + JudgeName(by) + "：" + rWhy : "";
                 notes.Add("effortless: 自动切到 " + rEffort + "（原 " + (rPrev ?? "?") + "）" + why);
             }
             if (!string.IsNullOrEmpty(rDown) && once(rDown)) notes.Add("effortless: " + rDown);
@@ -1041,18 +1000,18 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         }
         else st.Remove("swamp_at");
 
-        // Running hot: a usage window past HOT_AT. Said again 10 points later.
+        // Running hot: a usage window past HOT_AT. Said once for that window, in any chat, and once more at HOT_FINAL%.
         Limit top = Hottest(t);
         if (top != null)
         {
-            if (top.Pct >= HOT_AT && !HIDE.Contains("hot") && (Get(st, "hot_at") == null || top.Pct >= Num(Get(st, "hot_at"), 0) + 10))
+            string saidPath = Path.Combine(Data, "hot-said");
+            if (top.Pct >= HOT_AT && !HIDE.Contains("hot") && HotVisible(top, ReadJson(saidPath)))
             {
                 string reset = top.Resets > 0 ? "，" + ClockOf(top.Resets) + " 重置" : "";
                 string save = Saving() ? "省钱模式已开（Auto 最高 medium）。" : "输入 $effortless save 开启省钱模式：Auto 最高只到 medium，直到额度重置。";
                 notes.Add(string.Format(Inv, "effortless: {0}额度已用 {1}%{2}。{3}", LimitName(top.Minutes), (int)top.Pct, reset, save));
-                st["hot_at"] = top.Pct;
+                WriteJson(saidPath, Obj("window", HotWindow(top), "pct", top.Pct));
             }
-            if (top.Pct < HOT_AT) st.Remove("hot_at");
         }
 
         string upd = Path.Combine(Data, "update-available");
@@ -1098,11 +1057,35 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         WriteText(stamp, Now().ToString(Inv));
         try
         {
-            // A separate process, so the hook can finish; with its own pipes, so it holds none of Codex's open.
-            string self = Process.GetCurrentProcess().MainModule.FileName;
-            Process.Start(new ProcessStartInfo(self, "update-check") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true });
+            StartDetached("update-check");
         }
         catch { }
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO
+    {
+        public int cb; public string lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CreateProcess(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, int flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+
+    // Runs this program again on its own, so the hook can finish. Process.Start would hand it the hook's output (even
+    // with pipes of its own and the handles made uninheritable, as measured), and Codex would wait until it exits:
+    // CreateProcess with no handles inherited and no window.
+    static void StartDetached(string args)
+    {
+        string self = Process.GetCurrentProcess().MainModule.FileName;
+        var si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(si);
+        PROCESS_INFORMATION pi;
+        if (!CreateProcess(self, new StringBuilder(Quote(self) + " " + args), IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, null, ref si, out pi))
+            throw new System.ComponentModel.Win32Exception();
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
     }
     static int UpdateCheck()
     {
@@ -1195,7 +1178,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         var sb = new StringBuilder();
         sb.AppendFormat("codex-effortless {0}（{1}）\n", VERSION, Here);
         sb.AppendFormat(Inv, "设置：MODE={0} JUDGE={1} MODEL={2} MIN={3} MAX={4} BIAS={5} COLD={6}/{7}分钟 SWAMP_AT={8} HOT_AT={9} HANDOFF_FROM={10}\n", MODE, JUDGE, MODEL, MIN, MAX, BIAS, COLD, COLD_MINUTES, SWAMP_AT, HOT_AT, HANDOFF_FROM);
-        sb.Append("判断器：" + (API_URL != "" ? "API " + API_URL + "（" + API_MODEL + "）" + (API_KEY != "" ? "" : "，缺 key") + "，失败时 " + FALLBACK : "Codex 登录上的 " + MODEL) + (JevKey() != null ? "；Jev 先答" : "") + "\n");
+        sb.Append("判断器：Codex 登录上的 " + MODEL + (JevKey() != null ? "；Jev 先答" : "") + "\n");
         sb.Append("Auto：" + (AutoOn() ? "开" : "关（$effortless auto 打开）") + "；省钱模式：" + (Saving() ? "开" : "关") + "\n");
         string cli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
         sb.Append("Codex Desktop 的 Auto：" + (cli != null && cli.EndsWith("effortless.exe", StringComparison.OrdinalIgnoreCase) ? "开（CODEX_CLI_PATH 指向 effortless.exe）" : "关（effortless desktop on 打开）") + "\n");
@@ -1264,7 +1247,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     {
         string prompt = a.Length > 0 ? string.Join(" ", a) : "rename one variable in a single file";
         Decision r = Decide(prompt, "medium", null, null, 0, null, null, null, false);
-        if (r.Action == "judged") { Out(string.Format(Inv, "{0} 回答：{1}（{2:0}% 把握，{3:0.0} 秒）{4}\n", JudgeName(r.By), r.Effort, r.Sure * 100, r.Ms / 1000.0, r.Why != "" ? " — " + r.Why : "")); return 0; }
+        if (r.Action == "judged" || r.Action == "named") { Out(string.Format(Inv, "{0} 回答：{1}（{2:0}% 把握，{3:0.0} 秒）{4}\n", JudgeName(r.By), r.Effort, r.Sure * 100, r.Ms / 1000.0, r.Why != "" ? " — " + r.Why : "")); return 0; }
         Out("判断失败：" + (r.Fail ?? r.Action) + (r.Down != null ? "（" + r.Down + "）" : "") + "\n");
         return 1;
     }
@@ -1282,12 +1265,112 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
 
     static int HandoffShow()
     {
+        // A handoff Luna is still writing from a cold chat: wait a little (the shell tool has a short timeout), then say so.
+        DateTime deadline = DateTime.UtcNow.AddSeconds(8);
+        Dictionary<string, object> w;
+        while ((w = HandoffWriting()) != null)
+        {
+            if (Get(w, "failed") != null) { Out("Luna 没写成交接（" + Str(Get(w, "why")) + "）。回到原来的对话再发一次 $effortless handoff，由那个对话的模型来写。\n"); return 1; }
+            if (DateTime.UtcNow >= deadline) { Out(string.Format(Inv, "交接还在写（已 {0} 秒）。稍等十几秒再运行一次 resume。\n", (int)(Now() - Num(Get(w, "at"), 0)))); return 3; }
+            Thread.Sleep(1000);
+        }
         string text = ReadText(Path.Combine(Data, "handoff.md"));
         if (text == null) { Out("没有保存的交接\n"); return 1; }
         string ask = HANDOFF_AFTER == "confirm"
             ? "Read this, say in two lines where things stand and what is next, then wait for me."
             : "Continue with the next step. If it is marked \"needs user\", say what you need and wait.";
         Out("Handoff from the previous chat:\n\n" + text + "\n\n" + ask + "\n");
+        return 0;
+    }
+
+    // ------------------------------------------------------------ the handoff from a cold chat
+
+    const string HANDOFF_PROMPT = @"Write a handoff so this work can continue in a fresh chat that has no other context.
+
+Start with the project, its folder and the branch. Then:
+- Goal: one or two lines.
+- Done: what changed, with file paths, and how each change was checked. Never present something planned, skipped or untested as done.
+- Not done: what is half done, and the concrete blocker (a failed check, a missing approval, an open question).
+- Git: local changes, local commits, pushed commits and open PRs, as last seen in this chat. You cannot check now, so say ""as of last check"".
+- Next steps in priority order. Make the first one runnable: a file path, a command or a specific decision. Mark every step that needs the user with ""needs user"".
+- To resume: the start command, the preview URL, and the limits on what is allowed (what needs the user's approval, test vs production).
+- Do not redo: decisions made and why, approaches that failed.
+
+Give only the final state of anything that changed during the chat. Point to specs, plans and files instead of copying them. Leave out what is finished and no longer matters. Never include secrets, environment values or raw logs. Write in the language the user writes in. Short bullets, at most about 40 lines. Do not use tools. Reply with the handoff only, no preamble or farewell.";
+    const int COMPACT_TAIL = 6;
+
+    // The transcript as plain text: every message whole, tool calls and results cut short except in the last few messages.
+    static string CompactTranscript(List<KeyValuePair<string, string>> msgs, int toolChars, int tailChars)
+    {
+        Func<string, int, string> shorten = (s, n) => s.Length > n ? s.Substring(0, n) + " …[" + (s.Length - n) + " more characters]" : s;
+        var said = Enumerable.Range(0, msgs.Count).Where(i => msgs[i].Key == "user" || msgs[i].Key == "assistant").ToList();
+        int tailFrom = said.Count > COMPACT_TAIL ? said[said.Count - COMPACT_TAIL] : 0;
+        var sb = new StringBuilder();
+        for (int i = 0; i < msgs.Count; i++)
+        {
+            bool inTail = i >= tailFrom;
+            string role = msgs[i].Key, text = msgs[i].Value ?? "";
+            if (role == "tool") sb.Append("  [" + shorten(text, inTail ? tailChars : 400) + "]\n");
+            else if (role == "result") sb.Append("  → " + shorten(text, inTail ? tailChars : toolChars) + "\n");
+            else sb.Append("\n" + (role == "user" ? "USER" : "CODEX") + ": " + text.Trim() + "\n");
+        }
+        return sb.ToString().Trim();
+    }
+    // Roughly: four characters of ASCII to a token, one of anything else.
+    static double EstTokens(string s) { int wide = s.Count(c => c > 0x7f); return (s.Length - wide) / 4.0 + wide; }
+
+    static Dictionary<string, object> HandoffWriting()
+    {
+        string path = Path.Combine(Data, "handoff-writing");
+        var w = ReadJson(path);
+        if (w == null) return null;
+        if (Get(w, "failed") != null || Now() - Num(Get(w, "at"), 0) < 200) return w;
+        try { File.Delete(path); } catch { }
+        return null;
+    }
+
+    // Starts `handoff-write` on its own, so the hook can answer at once. False when there is no transcript to write from.
+    static bool StartHandoffWriter(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
+        WriteJson(Path.Combine(Data, "handoff-writing"), Obj("at", Now()));
+        try { StartDetached("handoff-write " + Quote(path)); return true; }
+        catch { return false; }
+    }
+
+    // Luna writes the quick handoff from a chat's transcript (the last chat unless one is named) and saves it.
+    static int HandoffWrite(string[] a)
+    {
+        string path = a.Length > 0 ? a[0] : LastTranscript();
+        if (path == null || !File.Exists(path)) { Out("找不到对话记录\n"); return 1; }
+        string marker = Path.Combine(Data, "handoff-writing");
+        WriteJson(marker, Obj("at", Now()));
+        Func<string, int> fail = why => { WriteJson(marker, Obj("at", Now(), "failed", 1, "why", why)); try { Out("交接没写成（" + why + "）\n"); } catch { } return 1; };
+        Transcript t = ReadTranscript(path, true);
+        if (t.Msgs.Count == 0) return fail("对话记录里没有消息");
+        ModelInfo info = GetModelInfo(MODEL);
+        double room = 0.75 * (info != null && info.Window > 0 ? info.Window : 272000);
+        string text = CompactTranscript(t.Msgs, 2000, 20000);
+        if (EstTokens(text) > room) text = CompactTranscript(t.Msgs, 300, 4000);
+        // Still too long: the start of the chat (after its first message) goes first.
+        var msgs = new List<KeyValuePair<string, string>>(t.Msgs);
+        while (EstTokens(text) > room && msgs.Count > COMPACT_TAIL + 2)
+        {
+            msgs.RemoveRange(1, Math.Max(1, msgs.Count / 10));
+            var shown = new List<KeyValuePair<string, string>>(msgs);
+            shown.Insert(1, new KeyValuePair<string, string>("user", "[… an earlier part of the chat is left out …]"));
+            text = CompactTranscript(shown, 300, 4000);
+        }
+        failed = "";
+        Answer[] answers = AskCodex(new[] { new Job { System = "You read a conversation between a user and Codex, an AI coding agent, and write the handoff the user asks for.",
+            Ask = text + "\n\n---\n" + HANDOFF_PROMPT, Effort = "medium" } }, 150);
+        string got = answers[0] == null ? "" : (answers[0].Text ?? "").Trim();
+        got = Regex.Replace(got, @"^\[effortless-judge\]\s*", "");
+        if (got.Length < 100) return fail(failed == "no-codex" || failed == "spawn" ? "找不到 codex" : "没有及时写完");
+        WriteText(Path.Combine(Data, "handoff.md"), got + "\n");
+        try { File.Delete(marker); } catch { }
+        if (HANDOFF_AFTER == "copy") CopyText(got);
+        try { Out("交接已由 " + MODEL + " 写好并保存（" + Path.Combine(Data, "handoff.md") + "）。输入 /new 开新对话，然后发送 $effortless resume。\n"); } catch { }
         return 0;
     }
 
@@ -1313,7 +1396,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         if (j == null) { Out("找不到 bench\\judge-cases.json\n"); return 1; }
         // Cases about effort relative to Claude models do not carry over to Codex models.
         var cases = Arr(Get(j, "cases")).Where(c => Str(Get(c, "kind")) != "model-relative").ToArray();
-        Out(string.Format(Inv, "{0} 个用例，判断器：{1}。每个约几秒，请稍候…\n", cases.Length, API_URL != "" ? "API" : "Luna"));
+        Out(string.Format(Inv, "{0} 个用例，判断器：{1}。每个约几秒，请稍候…\n", cases.Length, JevKey() != null ? "Jev + Luna" : "Luna"));
         var answers = new Decision[cases.Length];
         int next = -1;
         var workers = Enumerable.Range(0, 4).Select(w => new Thread(() =>
@@ -1849,6 +1932,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
                 case "test": return TestCmd(rest);
                 case "handoff-save": return HandoffSave();
                 case "handoff-show": case "resume": return HandoffShow();
+                case "handoff-write": return HandoffWrite(rest);
                 case "copy": return CopyText(new StreamReader(Console.OpenStandardInput(), Utf8).ReadToEnd()) ? 0 : 1;
                 case "bench": return Bench();
                 case "update": return Update();

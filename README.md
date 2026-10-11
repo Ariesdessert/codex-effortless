@@ -26,7 +26,7 @@ Changing the effort yourself pauses Auto for that chat and says so: you always w
 Codex on Windows and Codex inside WSL keep separate settings (`%USERPROFILE%\.codex` and `~/.codex`), so install on
 each side you use. Both read the same `effortless.conf` format.
 
-**Linux, macOS, WSL** (needs `codex`, `perl` with its core modules, and `curl` for an API judge or Jev):
+**Linux, macOS, WSL** (needs `codex`, `perl` with its core modules, and `curl` for Jev):
 
 ```bash
 bash install.sh
@@ -64,14 +64,16 @@ line it runs is in `install.ps1` and `windows\effortless.cs`; read them, and add
 | Situation | What happens |
 |---|---|
 | Auto picks another effort | `effortless: 自动切到 high（原 medium）`, and the turn runs at high. The status line shows it too |
+| The prompt names a level (`max effort`, `effort: low`, `xhigh`) | It runs at that level, past Min, Max and save mode, with no judge call. `don't use max effort` and `a medium sized image` name nothing |
 | The same effort, or a follow-up such as `ok`, `go`, `继续` | Nothing. A short follow-up keeps the effort without asking the judge, unless the last reply ended on a question: then the answer goes to the judge, since "B" can start a big job |
 | No Auto (plain `codex`), the judge wants more | The prompt is held back: `effortless: 建议 high（当前 medium）— reason。按 Alt+. 升 1 档后直接回车重发`. Sent again within 15 minutes, it goes through. `EFFORTLESS_MODE=warn` only says it instead |
 | No Auto, the judge wants less | `effortless: 建议 low（当前 high）— reason（按 Alt+, 降 2 档，对下一条消息生效）` |
 | The chat went cold (idle 30 minutes, context of 150k tokens or more) | The first prompt is held back once: it would reread the whole chat at full price. `/compact` or hand off first, or send it again to go ahead |
+| `$effortless handoff` in a cold chat (idle 30 minutes) | Luna writes the handoff from the transcript in the background instead of the chat's model rereading it all at full price; `/new` and `$effortless resume` pick it up. Send it again to have the chat's model write it |
 | The chat is swamped (context past 50%) | A warning naming `/compact` and `$effortless handoff`; again after 50k more tokens |
-| A 5-hour or weekly limit passes 80% | A warning with the reset time and `$effortless save`: save mode keeps Auto at medium or below until the limit resets |
+| A 5-hour or weekly limit passes 80% | A warning with the reset time and `$effortless save`: save mode keeps Auto at medium or below until the limit resets. Said once for that limit window, in any chat, and once more at 95% |
 | A fresh chat would pay off | From 30% context, every second prompt, the judge also reads what the chat was for, the trail of topics and the last reply, and says so only for a clear reason (the task finished and the next one is different, the chat goes in circles…) |
-| The judge fails or is slow | The prompt goes on at the effort it had; a judge that keeps failing is named once per session (`API 拒绝了 key（401）…`) |
+| The judge fails or is slow | The prompt goes on at the effort it had; a judge that keeps failing is named once per session (`判断器没有及时回答…`, `Jev 拒绝了 key（401）…`) |
 | A new version is out | Said once per session; `$effortless update` installs it |
 
 The status line (`install.sh --status-line`, or yes to the question) shows the effort in use, how full the context is
@@ -90,10 +92,10 @@ Type these in Codex (CLI or Desktop); the skill runs the program for you. The sa
 | `$effortless auto` / `auto on` / `auto off` | Auto on or off (and ends a pause from changing the effort by hand) |
 | `$effortless save` | save mode on or off |
 | `$effortless settings` / `set KEY VALUE` | shows or changes `effortless.conf` |
-| `$effortless handoff` | the quick handoff: the model writes it from what the chat shows, effortless saves it; then `/new` and `$effortless resume` |
+| `$effortless handoff` | the quick handoff: the model writes it from what the chat shows, effortless saves it; then `/new` and `$effortless resume`. In a cold chat Luna writes it from the transcript instead |
 | `$effortless handoff full` | checks git, rewrites `HANDOFF.md`, then the same (or runs your own skill: `EFFORTLESS_HANDOFF_SKILL`) |
 | `$effortless resume` | in a fresh chat: carries on from the saved handoff |
-| `$effortless test [prompt]` | asks the judge once, with no fallback |
+| `$effortless test [prompt]` | asks the judge once |
 | `$effortless bench` | scores the judge on the labelled prompts in `bench/judge-cases.json` |
 | `$effortless desktop on` / `off` | Auto in Codex Desktop (Windows) |
 | `$effortless update` | pulls the repo you installed from and reinstalls |
@@ -108,54 +110,32 @@ stand and wait instead of carrying on.
 | Setting | Default | Meaning |
 |---|---|---|
 | `EFFORTLESS_MODE` | `auto` | `auto` (`block` is the same), `warn` (only say, never switch or hold back, even through `codex-auto`), `off` |
-| `EFFORTLESS_JUDGE` | `auto` | `auto`: Luna (or your API), and Jev first when a TypeSafe key is set. `luna`: never Jev. `jev`: the key may also come from `~/.config/jev/.env` |
+| `EFFORTLESS_JUDGE` | `auto` | `auto`: Luna, and Jev first when a TypeSafe key is set. `luna`: never Jev. `jev`: the key may also come from `~/.config/jev/.env` |
 | `EFFORTLESS_MODEL` | `gpt-5.6-luna` | the judge model on your Codex login |
 | `EFFORTLESS_MIN` / `EFFORTLESS_MAX` | `low` / `max` | Auto stays between these; efforts the model does not take are skipped to the nearest one it does |
 | `EFFORTLESS_BIAS` | `0` | `-2` to `2`: tips the judge's close calls cheaper or smarter; sure calls stay |
 | `EFFORTLESS_TIMEOUT` | `20` | seconds before the prompt goes on at the effort it had |
 | `EFFORTLESS_COLD` / `_COLD_MINUTES` / `_COLD_TOKENS` | `block` / `30` / `150000` | the cold-chat check (`warn` or `off` instead of holding the prompt) |
 | `EFFORTLESS_SWAMP_AT` | `50` | percent of the context window |
-| `EFFORTLESS_HOT_AT` | `80` | percent of a usage limit |
+| `EFFORTLESS_HOT_AT` | `80` | percent of a usage limit (said once per limit window, again at 95%) |
 | `EFFORTLESS_HANDOFF_FROM` / `_EVERY` | `30` / `2` | when the judge checks whether a fresh chat would pay off (`off`: never) |
-| `EFFORTLESS_HIDE` | `reason` | parts to keep quiet: `reason` (the judge's reason on an Auto switch), `swamp`, `hot` |
+| `EFFORTLESS_HIDE` | `reason` | parts to keep quiet: `reason` (the judge's reason on an Auto switch), and the alerts `swamp` (context), `hot` (running low), `cold` (cold cache) |
 | `EFFORTLESS_BAR` | `changes` | `always`: a status line on every prompt |
 | `EFFORTLESS_CODEX` | empty | the codex the judge and Auto run. Empty: found by itself (on Windows also inside Codex Desktop) |
 
 Why 30 minutes for a cold cache: over this machine's Codex sessions, a prompt after up to about 20 minutes idle was
 still read almost entirely from the cache; after 45 to 60 minutes it mostly was not.
 
-## Judges: Luna, your API, Jev
+## Judges: Luna and Jev
 
-By default Luna judges on your Codex login: no key. To use any OpenAI-compatible endpoint (Chat Completions or the
-Responses API) instead, set a URL and a key:
-
-```bash
-EFFORTLESS_API_URL=https://openrouter.ai/api/v1
-EFFORTLESS_API_KEY_ENV=OPENROUTER_API_KEY     # read the key from this variable
-# EFFORTLESS_API_KEY=sk-or-...                # or put the key here (the file is private to you)
-EFFORTLESS_API_MODEL=openai/gpt-5.6-luna      # the model name that endpoint uses
-```
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `EFFORTLESS_API_URL` | empty | base URL; `/chat/completions` is added unless already there. Empty: judge on Codex |
-| `EFFORTLESS_API_KEY` / `EFFORTLESS_API_KEY_ENV` | empty | the key, or the name of an environment variable holding it |
-| `EFFORTLESS_API_MODEL` | `openai/gpt-5.6-luna` | `gpt-5.6-luna` on OpenAI itself |
-| `EFFORTLESS_API_STYLE` | `chat` | `chat` or `responses` (sent with `store: false`). A URL ending in either path picks the style itself |
-| `EFFORTLESS_API_REASONING` | empty | reasoning effort for the judge model (`none`, `low`, ...) |
-| `EFFORTLESS_API_FORMAT` | `schema` | `schema` (strict JSON schema), `object` (JSON mode), `none` |
-| `EFFORTLESS_API_UA` | `codex` | `codex` calls like Codex CLI (its User-Agent and `originator` header), for relays that only serve Codex; `none` sends neither; anything else is sent as the User-Agent |
-| `EFFORTLESS_FALLBACK` | `codex` | when the API fails: `codex` judges on your login instead; `none` keeps the effort |
-
-The handoff check goes to the same API. On Windows, Codex Desktop started from the Start menu does not see a variable
-set in one terminal: set it with `setx OPENROUTER_API_KEY sk-or-...` (user variables are read too).
+Luna judges on your Codex login: no key, and it goes the way your Codex goes (the same `CODEX_HOME` config and login).
 
 **Jev** ([TypeSafe](https://typesafe.ai)) answers in well under a second with its confidence: set
 `EFFORTLESS_TYPESAFE_KEY` (or `TYPESAFE_API_KEY`) and it judges first; when it is unsure (below even odds), fails or
-takes over 3 seconds, Luna or your API decides.
+takes over 3 seconds, Luna decides.
 
-Keys go only to the endpoint they belong to. On Linux they reach curl on stdin and the request body is a private file,
-so neither shows in the process list; on Windows they stay in memory.
+The key goes only to TypeSafe. On Linux it reaches curl on stdin and the request body is a private file, so neither
+shows in the process list; on Windows it stays in memory.
 
 ## How well it judges
 
@@ -173,7 +153,7 @@ The original measured Haiku at 92 to 93% and Jev at 99% on its 73 cases. The hel
 ## Cost and limits
 
 - A judged prompt waits for the judge: about **6 to 7 seconds** with Luna on Linux and WSL, **8 to 9** on Windows, almost
-  all of it Luna's answer; Jev or a fast API model is quicker. Follow-ups skip the judge. About 6,000 tokens a judgement
+  all of it Luna's answer; Jev is quicker. Follow-ups and named levels skip the judge. About 6,000 tokens a judgement
   on your Codex plan.
 - Auto and the hook read the session's transcript (effort, context, limits, messages), which is not a stable Codex
   interface.
@@ -186,6 +166,8 @@ The original measured Haiku at 92 to 93% and Jev at 99% on its 73 cases. The hel
   status line, the messages and `$effortless` carry the same information.
 - Compaction runs on the chat's model: Codex has no setting for a cheaper compaction model. Moving simple prompts to a
   cheaper model is not offered either (the original keeps it off by default too).
+- The original now runs a subagent at the effort Auto picked for its turn. Codex starts subagents inside the app-server,
+  out of Auto's reach, so they keep the effort Codex gives them.
 
 ## Develop
 

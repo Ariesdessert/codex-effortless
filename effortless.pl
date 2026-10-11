@@ -1,13 +1,12 @@
 #!/usr/bin/env perl
-# codex-effortless for Codex on Linux, macOS and WSL. One script, only core Perl modules (and curl for
-# the API judges):
+# codex-effortless for Codex on Linux, macOS and WSL. One script, only core Perl modules (and curl for Jev):
 #
 #   effortless.pl hook            the UserPromptSubmit hook (judge.sh runs this)
 #   effortless.pl codex [args]    start the Codex CLI with Auto: every prompt runs at the effort the judge picks
 #   effortless.pl stats | debug | auto [on|off] | save [on|off] | config [set KEY VALUE] | test [prompt]
-#   effortless.pl handoff-save | handoff-show | copy | bench | update | version
+#   effortless.pl handoff-save | handoff-show | handoff-write | copy | bench | update | version
 #
-# GPT-5.6 Luna (on your Codex login, or any OpenAI-compatible API you set, or Jev on TypeSafe) reads each
+# GPT-5.6 Luna on your Codex login (or Jev on TypeSafe first, when you have a key) reads each
 # prompt and picks the reasoning effort. Started through `codex` above, the effort is set for the turn
 # itself; started as plain `codex`, a hook can only say which effort to pick, because Codex hooks cannot
 # set it (openai/codex#40599).
@@ -26,11 +25,13 @@ use IO::Select;
 use IO::Handle;
 use Encode qw(encode_utf8 decode_utf8);
 
-our $VERSION = '0.4.0';
+our $VERSION = '0.5.0';
 my $HERE = dirname(abs_path($0));
 my $HOME = $ENV{HOME} // '';
 my $CODEX_HOME = $ENV{CODEX_HOME} || "$HOME/.codex";
 my $JSON = JSON::PP->new->utf8->canonical;
+# Text in, text out: for JSON that goes inside other text.
+my $JSON_TEXT = JSON::PP->new->canonical;
 
 # ---------------------------------------------------------------- settings
 
@@ -62,16 +63,6 @@ my $MAX = S('EFFORTLESS_MAX', 'max');
 my $BIAS = int(S('EFFORTLESS_BIAS', 0));
 my $BLOCK_GAP = int(S('EFFORTLESS_BLOCK_GAP', 1));
 my $BUDGET = int(S('EFFORTLESS_TIMEOUT', 20));
-my $API_URL = S('EFFORTLESS_API_URL', '');
-my $API_KEY = S('EFFORTLESS_API_KEY', '');
-my $KEY_ENV = S('EFFORTLESS_API_KEY_ENV', '');
-$API_KEY = $ENV{$KEY_ENV} // '' if $API_KEY eq '' && $KEY_ENV ne '';
-my $API_MODEL = S('EFFORTLESS_API_MODEL', 'openai/gpt-5.6-luna');
-my $API_STYLE = S('EFFORTLESS_API_STYLE', 'chat');
-my $API_FORMAT = S('EFFORTLESS_API_FORMAT', 'schema');
-my $API_REASONING = S('EFFORTLESS_API_REASONING', '');
-my $API_UA = S('EFFORTLESS_API_UA', 'codex');        # codex, none, or a User-Agent of your own
-my $FALLBACK = S('EFFORTLESS_FALLBACK', 'codex');
 my $JEV_URL = S('EFFORTLESS_JEV_URL', $ENV{JEV_URL} || 'https://api.typesafe.ai/v1/systemone');
 my $SWAMP_AT = S('EFFORTLESS_SWAMP_AT', 50);
 my $COLD = S('EFFORTLESS_COLD', 'block');           # block, warn, off
@@ -143,16 +134,18 @@ sub log_row {
 
 # What effortless reads from a session's transcript (~/.codex/sessions/.../rollout-*.jsonl): the effort and
 # model in use, how full the context is, when the last answer came, the usage limits, and the messages.
+# With $full, also every message and tool call in order (msgs), for a handoff written from the transcript.
 sub read_transcript {
-  my $path = shift;
-  my %t = (users => [], usage => [], turn_effort => {}, limits => {});
+  my ($path, $full) = @_;
+  my %t = (users => [], usage => [], turn_effort => {}, limits => {}, msgs => []);
   return \%t unless $path && -f $path;
   open my $f, '<:raw', $path or return \%t;
   my $n = 0;
   while (my $line = <$f>) {
     $n++;
     $t{desktop} = 1 if $n <= 3 && $line =~ /"originator"\s*:\s*"Codex Desktop"/;
-    next unless $line =~ /"type"\s*:\s*"(turn_context|token_count|message|token_usage_record)"/;
+    next unless $line =~ /"type"\s*:\s*"(turn_context|token_count|message|token_usage_record)"/
+      || $full && $line =~ /"type"\s*:\s*"[a-z_]*(call|call_output)"/;
     my $j = eval { $JSON->decode($line) } or next;
     my $p = $j->{payload} // {};
     my $type = $j->{type} // '';
@@ -180,9 +173,20 @@ sub read_transcript {
         # Codex sends its own context as user messages too: they start with a tag.
         next if $text =~ /^\s*(<[a-z_]+>|# AGENTS\.md)/;
         push @{ $t{users} }, $text;
+        push @{ $t{msgs} }, { role => 'user', text => $text } if $full;
       } elsif (($p->{role} // '') eq 'assistant') {
         $t{last_assistant} = $text if trim($text) ne '' && ($p->{phase} // 'final_answer') ne 'commentary';
+        push @{ $t{msgs} }, { role => 'assistant', text => $text } if $full && trim($text) ne '';
       }
+    } elsif ($full && $type eq 'response_item' && ($p->{type} // '') =~ /_call$/) {
+      my $input = $p->{arguments} // $p->{input} // $p->{action} // '';
+      push @{ $t{msgs} }, { role => 'tool', text => ($p->{name} // $p->{type}) . ' ' . (ref $input ? $JSON_TEXT->encode($input) : $input) };
+    } elsif ($full && $type eq 'response_item' && ($p->{type} // '') =~ /_call_output$/) {
+      my $o = $p->{output} // '';
+      $o = $o->{content} // $o if ref $o eq 'HASH';
+      $o = join "\n", map { ref $_ eq 'HASH' ? $_->{text} // '' : $_ } @$o if ref $o eq 'ARRAY';
+      $o = $JSON_TEXT->encode($o) if ref $o;
+      push @{ $t{msgs} }, { role => 'result', text => $o };
     } elsif ($type eq 'token_usage_record') {
       my $u = $p->{usage} // {};
       push @{ $t{usage} }, { turn => $p->{turn_id}, in => $u->{input_tokens} // 0, cached => $u->{cached_input_tokens} // 0, out => $u->{output_tokens} // 0 };
@@ -207,6 +211,7 @@ sub model_info {
       supported => [map { ref $_ ? ($_->{effort} // $_->{reasoningEffort}) : $_ } @{ $m->{supported_reasoning_levels} // [] }],
       updates => $m->{supports_reasoning_effort_updates},
       default => $m->{default_reasoning_level},
+      window => $m->{context_window},
     };
   }
   return undef;
@@ -307,6 +312,25 @@ sub handoff_evidence {
   );
 }
 
+# A level the prompt names ("max effort", "effort: high", "xhigh"), or nothing. The word effort must sit beside the
+# level, so "a medium sized image" names nothing, and "don't use max effort" is a no. As in the original, a named
+# level runs without the judge.
+my $LEVEL_WORD = '(low|medium|high|xhigh|x-high|extra[- ]high|max|maximum)';
+my $NAMED_LEVEL = qr/\b$LEVEL_WORD\s+effort\b|\beffort(?:\s+level)?\s*(?:[:=]|to|at|of|on)?\s*$LEVEL_WORD\b|\bxhigh\b/ia;
+my %LEVEL_OF = (low => 'low', medium => 'medium', high => 'high', xhigh => 'xhigh', 'x-high' => 'xhigh', 'extra high' => 'xhigh', 'extra-high' => 'xhigh', max => 'max', maximum => 'max');
+sub named_effort {
+  my $text = shift // '';
+  while ($text =~ /$NAMED_LEVEL/g) {
+    my ($at, $word) = ($-[0], $1 // $2 // 'xhigh');
+    my $before = lc substr($text, $at > 20 ? $at - 20 : 0, $at > 20 ? 20 : $at);
+    next if $before =~ /\b(not|no|don'?t|never|without|instead of)\b/a || $before =~ /(不要|不用|别|无需|不必)/;
+    $word = lc $word;
+    $word =~ s/\s+/ /;
+    return $LEVEL_OF{$word};
+  }
+  return undef;
+}
+
 # A short follow-up such as "go", "ok", "继续" keeps the effort the work is on, unless the last reply ended on a
 # question: then the answer can start a small or a big job, and goes to the judge.
 my $FOLLOW_RE = qr/^\s*(ok(ay)?|y(es)?|yep|sure|go( ahead)?|continue|do it|proceed|thanks?|lgtm|好的?|行|可以|继续|是的?|对|嗯|开始吧?|确认|没问题)\s*[.!。！~～]*\s*$/i;
@@ -374,7 +398,8 @@ sub read_lines {
 our $failed = '';
 
 # Codex: a short-lived app-server on your login, hooks and tools off, one ephemeral thread per question.
-# Takes [{system, ask, schema}], gives [{text, tokens}] (undef for a question that got no answer).
+# Takes [{system, ask, schema, effort}] (no schema: free text; effort none unless set), gives [{text, tokens}]
+# (undef for a question that got no answer).
 sub ask_codex {
   my ($jobs, $budget) = @_;
   my @off = map { ('--disable', $_) } qw(apps browser_use browser_use_external computer_use code_mode_host goals hooks image_generation multi_agent plugins remote_plugin shell_snapshot shell_tool skill_search sleep_tool tool_suggest unified_exec view_image web_search workspace_dependencies worktrees);
@@ -407,7 +432,9 @@ sub ask_codex {
           my $i = delete $pending{ $m->{id} };
           if (my $tid = $m->{result}{thread}{id}) {
             $thread_job{$tid} = $i;
-            $send->({ id => 20 + $i, method => 'turn/start', params => { threadId => $tid, effort => 'none', outputSchema => $jobs->[$i]{schema}, input => [{ type => 'text', text => "[effortless-judge] $jobs->[$i]{ask}" }] } });
+            my %turn = (threadId => $tid, effort => $jobs->[$i]{effort} // 'none', input => [{ type => 'text', text => "[effortless-judge] $jobs->[$i]{ask}" }]);
+            $turn{outputSchema} = $jobs->[$i]{schema} if $jobs->[$i]{schema};
+            $send->({ id => 20 + $i, method => 'turn/start', params => \%turn });
           } else {
             $over{$i} = 1;
           }
@@ -461,74 +488,11 @@ sub curl_finish {
   return ($code =~ /(\d{3})/ ? $1 : '000', $body);
 }
 
-# The headers that say who is calling. Some relays only serve Codex, so by default the judge calls the way Codex
-# CLI does: its User-Agent (the version from models_cache.json) and its originator header.
-sub api_headers {
-  my @h = ("Authorization: Bearer $API_KEY");
-  return (@h, 'X-Title: codex-effortless') if $API_UA eq 'none';
-  return (@h, "User-Agent: $API_UA") if $API_UA ne 'codex';
-  my $version = (read_json("$CODEX_HOME/models_cache.json") // {})->{client_version} || '0.162.1';
-  my ($os, undef, $release, undef, $arch) = POSIX::uname();
-  $arch = 'aarch64' if $arch eq 'arm64';
-  return (@h, "User-Agent: codex_cli_rs/$version ($os $release; $arch) " . ($ENV{TERM_PROGRAM} || 'unknown'), 'originator: codex_cli_rs');
-}
-
-# Any OpenAI-compatible endpoint: OpenRouter, OpenAI, a relay. Chat Completions or the Responses API.
-sub ask_api {
-  my ($jobs, $budget) = @_;
-  my $url = $API_URL;
-  $url =~ s{/+$}{};
-  my $style = $API_STYLE;
-  if ($url =~ m{/chat/completions$}) { $style = 'chat' }
-  elsif ($url =~ m{/responses$}) { $style = 'responses' }
-  else { $url .= $style eq 'responses' ? '/responses' : '/chat/completions' }
-  my @calls;
-  my @headers = api_headers();
-  for my $job (@$jobs) {
-    my $keys = join ', ', sort keys %{ $job->{schema}{properties} };
-    my $system = "$job->{system} Reply with a JSON object with the keys $keys.";
-    my %body;
-    if ($style eq 'responses') {
-      %body = (model => $API_MODEL, max_output_tokens => 400, store => JSON::PP::false, instructions => $system, input => $job->{ask});
-      $body{text} = { format => { type => 'json_object' } } if $API_FORMAT eq 'object';
-      $body{text} = { format => { type => 'json_schema', name => 'verdict', strict => JSON::PP::true, schema => $job->{schema} } } if $API_FORMAT eq 'schema';
-      $body{reasoning} = { effort => $API_REASONING } if $API_REASONING ne '';
-    } else {
-      %body = (model => $API_MODEL, max_tokens => 400, messages => [{ role => 'system', content => $system }, { role => 'user', content => $job->{ask} }]);
-      $body{response_format} = { type => 'json_object' } if $API_FORMAT eq 'object';
-      $body{response_format} = { type => 'json_schema', json_schema => { name => 'verdict', strict => JSON::PP::true, schema => $job->{schema} } } if $API_FORMAT eq 'schema';
-      $body{reasoning_effort} = $API_REASONING if $API_REASONING ne '';
-    }
-    push @calls, curl_start($url, \@headers, $JSON->encode(\%body), $budget);
-  }
-  my @answers;
-  for my $i (0 .. $#calls) {
-    my ($code, $raw) = curl_finish($calls[$i]);
-    if ($code ne '200') { $failed = "http-$code"; next }
-    my $j = eval { $JSON->decode($raw) } or do { $failed = 'reply'; next };
-    my $text = $style eq 'responses'
-      ? ($j->{output_text} // join '', map { $_->{text} // '' } grep { ($_->{type} // '') eq 'output_text' } map { @{ $_->{content} // [] } } @{ $j->{output} // [] })
-      : $j->{choices}[0]{message}{content};
-    $answers[$i] = { text => $text // '', tokens => $j->{usage}{total_tokens} // 0 };
-  }
-  return \@answers;
-}
-
-# The configured judge for a set of questions: the API when one is set (falling back to Codex), else Codex.
-# Sets $by to the judge that answered, and gives the reason a judge failed in $_[1] (for the once-a-session notice).
+# The judge for a set of questions: Luna on your Codex login. Sets $by to the judge that answered.
 sub ask_judge {
-  my ($jobs, $why_down) = @_;
-  $failed = '';
-  if ($API_URL ne '' && $API_KEY ne '') {
-    $by = 'api';
-    my $a = ask_api($jobs, $BUDGET);
-    return $a if $a && grep { $_ } @$a;
-    $$why_down = "api:$failed" if $why_down;
-    log_row(undef, '-', '-', 0, 0, "fail:api:$failed");
-    return $a if $FALLBACK ne 'codex';
-    $failed = '';
-  }
-  $by = 'codex';
+  my $jobs = shift;
+  $failed = q{};
+  $by = q{codex};
   return ask_codex($jobs, $BUDGET);
 }
 
@@ -608,8 +572,14 @@ sub shape_effort {
   $i = $lo if $i < $lo;
   $i = $hi if $i > $hi;
   $i = rank('medium') if saving() && $i > rank('medium');
-  if ($supported && @$supported && !grep { $_ eq $LEVELS[$i] } @$supported) {
-    # The nearest level the model takes, the higher one on a tie.
+  return fit_supported($LEVELS[$i], $supported);
+}
+
+# The nearest level the model takes, the higher one on a tie.
+sub fit_supported {
+  my ($level, $supported) = @_;
+  my $i = rank($level);
+  if ($supported && @$supported && !grep { $_ eq $level } @$supported) {
     my ($best, $dist);
     for my $s (@$supported) {
       my $r = rank($s);
@@ -630,8 +600,9 @@ sub saving {
 }
 sub auto_on { !-e "$DATA/auto-off" }
 
-# One prompt through the pipeline every caller shares (the hook, Auto, the bench): a follow-up keeps the effort,
-# else Jev (when set) and then Luna judge. With $handoff, the handoff question goes along with Luna's.
+# One prompt through the pipeline every caller shares (the hook, Auto, the bench): a level named in the prompt
+# ("max effort") runs as asked, a follow-up keeps the effort, else Jev (when set) and then Luna judge. With $handoff,
+# the handoff question goes along with Luna's.
 # Gives {effort (shaped), raw, sure, why, by, ms, tokens, action, down, handoff}.
 sub decide {
   my %a = @_;
@@ -641,8 +612,14 @@ sub decide {
   my %r = (tokens => 0);
   my $prompt = $a{prompt};
   $prompt .= "\n\n[The message comes with $a{attachments} to look at.]" if $a{attachments};
+  my $named = !$a{only_handoff} && $a{prompt} !~ m{^\s*[\$/]} ? named_effort($a{prompt}) : undef;
   if ($a{only_handoff}) {
     %r = (%r, effort => $current, action => q{skip});
+  } elsif ($named) {
+    # The person said the level: it runs past Min, Max and save mode, and no judge is asked.
+    $by = q{named};
+    %r = (%r, effort => fit_supported($named, $a{supported}), raw => $named, sure => 1, why => q{你点名要的}, action => q{named}, by => q{named}, ms => 0);
+    return \%r unless $a{handoff};
   } elsif (!$a{attachments} && $current && rank($current) >= 0 && keeps_effort($a{prompt}, $a{last_assistant})) {
     %r = (%r, effort => $current, raw => $current, sure => 1, why => '', action => 'follow-up');
     return \%r unless $a{handoff};
@@ -660,9 +637,7 @@ sub decide {
   if ($a{handoff}) { $handoff_job = scalar @jobs; push @jobs, { system => $HANDOFF_SYSTEM, ask => $a{handoff}, schema => $HANDOFF_SCHEMA } }
   if (@jobs) {
     my $judge_by = $by;
-    my $why_down;
-    my $answers = ask_judge(\@jobs, \$why_down) // [];
-    $r{down} //= api_failure($why_down) if $why_down && defined $effort_job;
+    my $answers = ask_judge(\@jobs) // [];
     $r{tokens} += $_->{tokens} // 0 for grep { $_ } @$answers;
     if (defined $effort_job) {
       if (my $v = parse_verdict(($answers->[$effort_job] // {})->{text})) {
@@ -684,12 +659,6 @@ sub decide {
   $r{by} = $by;
   $r{effort} = $r{action} eq 'judged' ? shape_effort($r{raw}, $r{sure}, $a{supported}) : ($r{effort} // $current);
   return \%r;
-}
-sub api_failure {
-  my $w = shift // return undef;
-  my ($code) = $w =~ /http-(\d+)/;
-  my $what = !$code || $code eq '000' ? 'API 没有及时回答' : $code =~ /^40[13]$/ ? "API 拒绝了 key（$code）" : $code eq '402' ? "API 额度用完了（$code）" : $code eq '429' ? "API 限流了（$code）" : "API 出错了（$code）";
-  return $FALLBACK eq 'codex' ? "$what，改用 Codex 登录判断" : $what;
 }
 
 # ---------------------------------------------------------------- per-session memory
@@ -715,6 +684,16 @@ sub hottest {
   my $t = shift;
   my ($top) = sort { $b->{pct} <=> $a->{pct} } values %{ $t->{limits} };
   return $top;
+}
+
+# Running hot is said once per usage window (its length and reset time), and once more when it passes HOT_FINAL.
+my $HOT_FINAL = 95;
+# To the quarter hour: the reset time Codex reports can shift by seconds between turns.
+sub hot_window { my $top = shift; join ' ', $top->{minutes} // 0, $top->{resets} ? int($top->{resets} / 900 + 0.5) : '' }
+sub hot_visible {
+  my ($top, $said) = @_;
+  return 1 if !$said || ($said->{window} // '') ne hot_window($top);
+  return $top->{pct} >= $HOT_FINAL && ($said->{pct} // 0) < $HOT_FINAL;
 }
 
 # ---------------------------------------------------------------- the hook
@@ -743,9 +722,20 @@ sub hook {
   my $idle = $t->{last_at} ? (now() - $t->{last_at}) / 60 : 0;
   my $cold = $t->{last_at} && $idle >= $COLD_MINUTES;
 
+  # A quick handoff from a cold chat: the chat's model would reread the whole context at full price to write it.
+  # Luna writes it from the transcript instead, in the background, as the original has Haiku do. Sent again in the
+  # same idle spell, the prompt goes through and the chat's model writes it.
+  if ($cold && $prompt =~ /^\s*\$effortless\s+handoff\s*$/i && abs(($st->{cold_handoff_for} // 0) - $t->{last_at}) >= 0.01 && start_handoff_writer($p->{transcript_path})) {
+    $st->{cold_handoff_for} = $t->{last_at};
+    save_session_state($sid, $st);
+    log_row($current, '-', '-', 0, 0, 'cold-handoff');
+    say_json({ decision => 'block', reason => "effortless: 对话已冷，快速交接改由 $MODEL 在后台从对话记录写，不让当前模型按全价重读约 " . ktokens($t->{tokens}) . " tokens。输入 /new 开新对话，发送 \$effortless resume 即可接上（还没写完会稍等）。想让当前模型来写，直接回车重发。" });
+    exit 0;
+  }
+
   # A chat gone cold: the next message rereads the whole context at full price. Held back once, so /compact or a
   # handoff can come first; sent again (or anything else sent in the same idle spell), it goes through.
-  if ($cold && $COLD ne 'off' && ($t->{tokens} // 0) >= $COLD_TOKENS && ($st->{cold_for} // 0) != $t->{last_at}) {
+  if ($cold && $COLD ne 'off' && !$HIDE{cold} && ($t->{tokens} // 0) >= $COLD_TOKENS && abs(($st->{cold_for} // 0) - $t->{last_at}) >= 0.01) {
     my $msg = sprintf('effortless: 对话已冷（闲置 %d 分钟），这条消息会按全价重读约 %s tokens。', $idle, ktokens($t->{tokens}));
     if ($COLD eq 'block') {
       $st->{cold_for} = $t->{last_at};
@@ -777,7 +767,7 @@ sub hook {
     if (($routed->{action} // '') eq 'manual') {
       push @notes, 'effortless: 你手动改了档位，本对话的 Auto 已暂停（你说了算）。输入 $effortless auto 恢复。' unless $st->{manual_said}++;
     } elsif (($routed->{effort} // '') ne ($routed->{previous} // '') && $routed->{effort}) {
-      my $why = !$HIDE{reason} && $routed->{why} ? ' · ' . judge_name($routed->{by}) . "：$routed->{why}" : '';
+      my $why = (!$HIDE{reason} || ($routed->{action} // q{}) eq q{named}) && $routed->{why} ? ' · ' . judge_name($routed->{by}) . "：$routed->{why}" : '';
       push @notes, "effortless: 自动切到 $routed->{effort}（原 " . ($routed->{previous} // '?') . "）$why";
     }
     push @notes, "effortless: $routed->{down}" if $routed->{down} && !$st->{warned}{ $routed->{down} }++;
@@ -848,15 +838,14 @@ sub hook {
     delete $st->{swamp_at};
   }
 
-  # Running hot: a usage window past HOT_AT. Said again 10 points later.
+  # Running hot: a usage window past HOT_AT. Said once for that window, in any chat, and once more at $HOT_FINAL%.
   if (my $top = hottest($t)) {
-    if ($top->{pct} >= $HOT_AT && !$HIDE{hot} && (!defined $st->{hot_at} || $top->{pct} >= $st->{hot_at} + 10)) {
+    if ($top->{pct} >= $HOT_AT && !$HIDE{hot} && hot_visible($top, read_json("$DATA/hot-said"))) {
       my $reset = $top->{resets} ? '，' . clock_of($top->{resets}) . ' 重置' : '';
       my $save = saving() ? '省钱模式已开（Auto 最高 medium）。' : '输入 $effortless save 开启省钱模式：Auto 最高只到 medium，直到额度重置。';
       push @notes, sprintf('effortless: %s额度已用 %d%%%s。%s', limit_name($top->{minutes}), $top->{pct}, $reset, $save);
-      $st->{hot_at} = $top->{pct};
+      write_json("$DATA/hot-said", { window => hot_window($top), pct => $top->{pct} });
     }
-    delete $st->{hot_at} if $top->{pct} < $HOT_AT;
   }
 
   if (-e "$DATA/update-available" && !$st->{update_said}++) {
@@ -880,7 +869,7 @@ sub hook {
   exit 0;
 }
 
-sub judge_name { my $b = shift // ''; $b eq 'jev' ? 'Jev' : $b eq 'api' ? 'API' : 'Luna' }
+sub judge_name { my $b = shift // q{}; $b eq q{jev} ? q{Jev} : $b eq q{named} ? q{你} : q{Luna} }
 
 # At most every 6 hours, in the background: is the repo the hook was installed from behind its remote?
 sub check_update_later {
@@ -951,7 +940,7 @@ sub cmd_stats {
 sub cmd_debug {
   out("codex-effortless $VERSION（$HERE）\n");
   out("设置：MODE=$MODE JUDGE=$JUDGE MODEL=$MODEL MIN=$MIN MAX=$MAX BIAS=$BIAS COLD=$COLD/${COLD_MINUTES}分钟 SWAMP_AT=$SWAMP_AT HOT_AT=$HOT_AT HANDOFF_FROM=$HANDOFF_FROM\n");
-  out('判断器：' . ($API_URL ne '' ? "API $API_URL（$API_MODEL）" . ($API_KEY ne '' ? '' : '，缺 key') . "，失败时 $FALLBACK" : "Codex 登录上的 $MODEL") . (jev_key() ? '；Jev 先答' : '') . "\n");
+  out("判断器：Codex 登录上的 $MODEL" . (jev_key() ? '；Jev 先答' : '') . "\n");
   out('Auto：' . (auto_on() ? '开' : '关（$effortless auto 打开）') . '；省钱模式：' . (saving() ? '开' : '关') . "\n");
   my $codex = `command -v '$CODEX' 2>/dev/null`;
   out('codex：' . (trim($codex) || "找不到 $CODEX") . "\n");
@@ -1009,7 +998,7 @@ sub cmd_test {
   my $prompt = join(' ', @_) || 'rename one variable in a single file';
   $prompt = decode_utf8($prompt);
   my $r = decide(prompt => $prompt, current => 'medium');
-  if ($r->{action} eq 'judged') { out(sprintf("%s 回答：%s（%.0f%% 把握，%.1f 秒）%s\n", judge_name($r->{by}), $r->{effort}, $r->{sure} * 100, $r->{ms} / 1000, $r->{why} ? " — $r->{why}" : '')) }
+  if ($r->{action} =~ /^(judged|named)$/) { out(sprintf("%s 回答：%s（%.0f%% 把握，%.1f 秒）%s\n", judge_name($r->{by}), $r->{effort}, $r->{sure} * 100, $r->{ms} / 1000, $r->{why} ? " — $r->{why}" : '')) }
   else { out('判断失败：' . ($r->{fail} // $r->{action}) . ($r->{down} ? "（$r->{down}）" : '') . "\n"); exit 1 }
 }
 
@@ -1023,12 +1012,108 @@ sub cmd_handoff_save {
 }
 
 sub cmd_handoff_show {
+  # A handoff Luna is still writing from a cold chat: wait a little (the shell tool has a short timeout), then say so.
+  my $deadline = now() + 8;
+  while (my $w = handoff_writing()) {
+    die "Luna 没写成交接（$w->{why}）。回到原来的对话再发一次 \$effortless handoff，由那个对话的模型来写。\n" if $w->{failed};
+    if (now() >= $deadline) { out(sprintf("交接还在写（已 %d 秒）。稍等十几秒再运行一次 resume。\n", now() - $w->{at})); exit 3 }
+    sleep 1;
+  }
   my $text = slurp("$DATA/handoff.md");
   die "没有保存的交接\n" unless defined $text;
   my $ask = $HANDOFF_AFTER eq 'confirm'
     ? 'Read this, say in two lines where things stand and what is next, then wait for me.'
     : 'Continue with the next step. If it is marked "needs user", say what you need and wait.';
   out("Handoff from the previous chat:\n\n", decode_utf8($text), "\n\n$ask\n");
+}
+
+# ---------------------------------------------------------------- the handoff from a cold chat
+
+my $HANDOFF_PROMPT = join "\n",
+  'Write a handoff so this work can continue in a fresh chat that has no other context.',
+  '',
+  'Start with the project, its folder and the branch. Then:',
+  '- Goal: one or two lines.',
+  '- Done: what changed, with file paths, and how each change was checked. Never present something planned, skipped or untested as done.',
+  '- Not done: what is half done, and the concrete blocker (a failed check, a missing approval, an open question).',
+  '- Git: local changes, local commits, pushed commits and open PRs, as last seen in this chat. You cannot check now, so say "as of last check".',
+  '- Next steps in priority order. Make the first one runnable: a file path, a command or a specific decision. Mark every step that needs the user with "needs user".',
+  "- To resume: the start command, the preview URL, and the limits on what is allowed (what needs the user's approval, test vs production).",
+  '- Do not redo: decisions made and why, approaches that failed.',
+  '',
+  'Give only the final state of anything that changed during the chat. Point to specs, plans and files instead of '
+    . 'copying them. Leave out what is finished and no longer matters. Never include secrets, environment values or raw '
+    . 'logs. Write in the language the user writes in. Short bullets, at most about 40 lines. Do not use tools. Reply '
+    . 'with the handoff only, no preamble or farewell.';
+my $COMPACT_TAIL = 6;
+
+# The transcript as plain text: every message whole, tool calls and results cut short except in the last few messages.
+sub compact_transcript {
+  my ($msgs, $tool_chars, $tail_chars) = @_;
+  my $short = sub { my ($s, $n) = @_; length($s) > $n ? substr($s, 0, $n) . ' …[' . (length($s) - $n) . ' more characters]' : $s };
+  my @said = grep { $msgs->[$_]{role} =~ /^(user|assistant)$/ } 0 .. $#$msgs;
+  my $tail_from = @said > $COMPACT_TAIL ? $said[-$COMPACT_TAIL] : 0;
+  my @out;
+  for my $i (0 .. $#$msgs) {
+    my ($role, $text) = @{ $msgs->[$i] }{qw(role text)};
+    my $in_tail = $i >= $tail_from;
+    if ($role eq 'tool') { push @out, '  [' . $short->($text, $in_tail ? $tail_chars : 400) . ']' }
+    elsif ($role eq 'result') { push @out, '  → ' . $short->($text, $in_tail ? $tail_chars : $tool_chars) }
+    else { push @out, "\n" . ($role eq 'user' ? 'USER' : 'CODEX') . ': ' . trim($text) }
+  }
+  return trim(join "\n", @out);
+}
+# Roughly: four characters of ASCII to a token, one of anything else.
+sub est_tokens { my $s = shift; my $wide = () = $s =~ /[^\x00-\x7f]/g; (length($s) - $wide) / 4 + $wide }
+
+sub handoff_writing {
+  my $w = read_json("$DATA/handoff-writing") or return undef;
+  return $w if $w->{failed} || now() - ($w->{at} // 0) < 200;
+  unlink "$DATA/handoff-writing";
+  return undef;
+}
+
+# Starts `handoff-write` on its own, so the hook can answer at once. False when there is no transcript to write from.
+sub start_handoff_writer {
+  my $path = shift;
+  return 0 unless $path && -f $path;
+  write_json("$DATA/handoff-writing", { at => now() });
+  my $pid = fork;
+  return 0 unless defined $pid;
+  return 1 if $pid;
+  # The child must not hold the hook's output open: Codex waits for it to close.
+  setsid();
+  open STDIN, '<', '/dev/null'; open STDOUT, '>', '/dev/null'; open STDERR, '>', '/dev/null';
+  { exec { $^X } $^X, abs_path($0), 'handoff-write', $path }
+  _exit(127);
+}
+
+# Luna writes the quick handoff from a chat's transcript (the last chat unless one is named) and saves it.
+sub cmd_handoff_write {
+  my $path = shift // last_transcript();
+  die "找不到对话记录\n" unless $path && -f $path;
+  write_json("$DATA/handoff-writing", { at => now() });
+  my $t = read_transcript($path, 1);
+  my $fail = sub { write_json("$DATA/handoff-writing", { at => now(), failed => 1, why => shift }); die "交接没写成\n" };
+  $fail->('对话记录里没有消息') unless @{ $t->{msgs} };
+  my $room = 0.75 * ((model_info($MODEL) // {})->{window} || 272000);
+  my $text = compact_transcript($t->{msgs}, 2000, 20000);
+  $text = compact_transcript($t->{msgs}, 300, 4000) if est_tokens($text) > $room;
+  # Still too long: the start of the chat (after its first message) goes first.
+  my @msgs = @{ $t->{msgs} };
+  while (est_tokens($text) > $room && @msgs > $COMPACT_TAIL + 2) {
+    splice @msgs, 1, int(@msgs / 10) || 1;
+    $text = compact_transcript([$msgs[0], { role => 'user', text => '[… an earlier part of the chat is left out …]' }, @msgs[1 .. $#msgs]], 300, 4000);
+  }
+  my $answers = ask_codex([{ system => 'You read a conversation between a user and Codex, an AI coding agent, and write the handoff the user asks for.',
+    ask => "$text\n\n---\n$HANDOFF_PROMPT", effort => 'medium' }], 150) // [];
+  my $got = trim(($answers->[0] // {})->{text} // '');
+  $fail->($failed eq 'spawn' ? "找不到 $CODEX" : '没有及时写完') if length($got) < 100;
+  $got =~ s/^\[effortless-judge\]\s*//;
+  spew("$DATA/handoff.md", encode_utf8($got) . "\n", 0600);
+  unlink "$DATA/handoff-writing";
+  copy_text(encode_utf8($got)) if $HANDOFF_AFTER eq 'copy';
+  out("交接已由 $MODEL 写好并保存（$DATA/handoff.md）。输入 /new 开新对话，然后发送 \$effortless resume。\n");
 }
 
 sub copy_text {
@@ -1048,7 +1133,7 @@ sub cmd_bench {
   my $j = read_json($file) or die "找不到 bench/judge-cases.json\n";
   # Cases about effort relative to Claude models do not carry over to Codex models.
   my @cases = grep { $_->{kind} ne 'model-relative' } @{ $j->{cases} };
-  out(sprintf("%d 个用例，判断器：%s。每个约几秒，请稍候…\n", scalar @cases, $API_URL ne '' ? 'API' : 'Luna'));
+  out(sprintf("%d 个用例，判断器：%s。每个约几秒，请稍候…\n", scalar @cases, jev_key() ? q{Jev + Luna} : q{Luna}));
   my (@answers, %kids);
   my $par = 4;
   for my $i (0 .. $#cases) {
@@ -1405,6 +1490,7 @@ sub main {
   elsif ($cmd eq 'test') { cmd_test(@_) }
   elsif ($cmd eq 'handoff-save') { cmd_handoff_save() }
   elsif ($cmd eq 'handoff-show' || $cmd eq 'resume') { cmd_handoff_show() }
+  elsif ($cmd eq 'handoff-write') { cmd_handoff_write(@_) }
   elsif ($cmd eq 'copy') { my $t = do { local $/; <STDIN> }; exit(copy_text($t) ? 0 : 1) }
   elsif ($cmd eq 'bench') { cmd_bench() }
   elsif ($cmd eq 'update') { cmd_update() }

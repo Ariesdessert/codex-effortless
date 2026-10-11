@@ -30,11 +30,11 @@ short line each.
 | `$effortless save` / `save on` / `save off` | `save` ...: save mode keeps Auto at medium or below until the usage limit resets |
 | `$effortless settings` | `config`, then offer to change any of them |
 | `$effortless set KEY VALUE` | `config set EFFORTLESS_KEY VALUE` (add the `EFFORTLESS_` prefix if missing) |
-| `$effortless test [prompt]` | `test [prompt]`: asks the judge once, with no fallback |
+| `$effortless test [prompt]` | `test [prompt]`: asks the judge once |
 | `$effortless bench` | `bench`: scores the judge on labelled prompts (a few minutes; say so first) |
 | `$effortless update` | `update` |
 | `$effortless desktop on` / `off` | `desktop on` or `desktop off` (Windows only): Auto in Codex Desktop |
-| `$effortless resume` | `resume`, then follow the handoff it prints as if the user had sent it |
+| `$effortless resume` | `resume`, then follow the handoff it prints as if the user had sent it. If it says the handoff is still being written, wait about 15 seconds and run it again |
 | `$effortless handoff` | the quick handoff below |
 | `$effortless handoff full` | the full handoff below |
 

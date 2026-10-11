@@ -65,7 +65,7 @@ fi
 
 command -v codex >/dev/null || { echo "codex is not on PATH."; exit 1; }
 perl -MJSON::PP -MDigest::SHA -e1 2>/dev/null || { echo "perl with JSON::PP and Digest::SHA is required (core modules)."; exit 1; }
-command -v curl >/dev/null || echo "Note: curl is not installed; only needed for an API judge or Jev."
+command -v curl >/dev/null || echo "Note: curl is not installed; only needed for Jev."
 
 mkdir -p "$DEST/bench" "$SKILL"
 install -m 755 "$HERE/effortless.pl" "$DEST/effortless.pl"
@@ -119,16 +119,9 @@ set_conf() { perl "$DEST/effortless.pl" config set "$1" "$2" >/dev/null; }
 if [ -z "$QUIET" ]; then
   echo
   echo "Setup (Enter keeps the choice in brackets; change any of it later with \$effortless settings):"
-  read -r -p "  Judge: 1 Luna on your Codex login, 2 an OpenAI-compatible API, 3 add Jev (TypeSafe key) [1] " j
+  read -r -p "  Judge: 1 Luna on your Codex login, 2 add Jev (TypeSafe key) [1] " j
   case ${j:-1} in
     2)
-      read -r -p "  API base URL (e.g. https://openrouter.ai/api/v1): " url
-      read -r -p "  Name of the environment variable holding the key (e.g. OPENROUTER_API_KEY): " kenv
-      read -r -p "  Model name at that API [openai/gpt-5.6-luna]: " am
-      [ -n "$url" ] && set_conf EFFORTLESS_API_URL "$url"
-      [ -n "$kenv" ] && set_conf EFFORTLESS_API_KEY_ENV "$kenv"
-      [ -n "$am" ] && set_conf EFFORTLESS_API_MODEL "$am" ;;
-    3)
       read -r -s -p "  TypeSafe key (not shown; saved in $CONF, readable only by you): " k; echo
       [ -n "$k" ] && set_conf EFFORTLESS_TYPESAFE_KEY "$k" ;;
   esac
