@@ -63,11 +63,11 @@ line it runs is in `install.ps1` and `windows\effortless.cs`; read them, and add
 
 | Situation | What happens |
 |---|---|
-| Auto picks another effort | `effortless: 自动切到 high（原 medium）`, and the turn runs at high. The status line shows it too |
+| Auto picks another effort | `effortless: 自动切到 high（原 medium）`, and the turn runs at high. The status line shows it too. With `reason` not hidden, the judge's line follows with how sure it was: `· Luna 82%：重构多个文件` |
 | The prompt names a level (`max effort`, `effort: low`, `xhigh`) | It runs at that level, past Min, Max and save mode, with no judge call. `don't use max effort` and `a medium sized image` name nothing |
 | The same effort, or a follow-up such as `ok`, `go`, `继续` | Nothing. A short follow-up keeps the effort without asking the judge, unless the last reply ended on a question: then the answer goes to the judge, since "B" can start a big job |
-| No Auto (plain `codex`), the judge wants more | The prompt is held back: `effortless: 建议 high（当前 medium）— reason。按 Alt+. 升 1 档后直接回车重发`. Sent again within 15 minutes, it goes through. `EFFORTLESS_MODE=warn` only says it instead |
-| No Auto, the judge wants less | `effortless: 建议 low（当前 high）— reason（按 Alt+, 降 2 档，对下一条消息生效）` |
+| No Auto (plain `codex`), the judge wants more | The prompt is held back: `effortless: 建议 high（当前 medium）— Luna 60%：reason。按 Alt+. 升 1 档后直接回车重发`. Sent again within 15 minutes, it goes through. `EFFORTLESS_MODE=warn` only says it instead |
+| No Auto, the judge wants less | `effortless: 建议 low（当前 high）— Luna 90%：reason（按 Alt+, 降 2 档，对下一条消息生效）` |
 | The chat went cold (idle 30 minutes, context of 150k tokens or more) | The first prompt is held back once: it would reread the whole chat at full price. `/compact` or hand off first, or send it again to go ahead |
 | `$effortless handoff` in a cold chat (idle 30 minutes) | Luna writes the handoff from the transcript in the background instead of the chat's model rereading it all at full price; `/new` and `$effortless resume` pick it up. Send it again to have the chat's model write it |
 | The chat is swamped (context past 50%) | A warning naming `/compact` and `$effortless handoff`; again after 50k more tokens |
@@ -78,7 +78,12 @@ line it runs is in `install.ps1` and `windows\effortless.cs`; read them, and add
 
 The status line (`install.sh --status-line`, or yes to the question) shows the effort in use, how full the context is
 and the 5-hour and weekly limits all the time, which is what the original's bar showed. `EFFORTLESS_BAR=always` also puts
-a line like `effortless: high · ◔ 38% · 缓存约剩 24 分钟 · 5 小时 42%` on every prompt, for Codex Desktop.
+a line like `effortless: high · ◔ 38% · 缓存约剩 24 分钟 · 5 小时 42%` on every prompt, for Codex Desktop; with `reason`
+not hidden it ends on the judge's line, as the original's bar does under the effort (`· Luna 82%：重构多个文件`).
+
+The percent is how sure the judge said it was. It is what the slider (`EFFORTLESS_BIAS`) acts on: at `±1` a call below
+65% moves one level, at `±2` below 85%; at `0` nothing moves. A judge that gives no figure is taken as sure, as in the
+original, so the slider leaves it alone.
 
 ## Commands
 
@@ -119,7 +124,7 @@ stand and wait instead of carrying on.
 | `EFFORTLESS_SWAMP_AT` | `50` | percent of the context window |
 | `EFFORTLESS_HOT_AT` | `80` | percent of a usage limit (said once per limit window, again at 95%) |
 | `EFFORTLESS_HANDOFF_FROM` / `_EVERY` | `30` / `2` | when the judge checks whether a fresh chat would pay off (`off`: never) |
-| `EFFORTLESS_HIDE` | `reason` | parts to keep quiet: `reason` (the judge's reason on an Auto switch), and the alerts `swamp` (context), `hot` (running low), `cold` (cold cache) |
+| `EFFORTLESS_HIDE` | `reason` | parts to keep quiet: `reason` (the judge's line and how sure it was), and the alerts `swamp` (context), `hot` (running low), `cold` (cold cache). Empty (`config set EFFORTLESS_HIDE ""`) shows everything |
 | `EFFORTLESS_BAR` | `changes` | `always`: a status line on every prompt |
 | `EFFORTLESS_CODEX` | empty | the codex the judge and Auto run. Empty: found by itself (on Windows also inside Codex Desktop) |
 
