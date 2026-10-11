@@ -1281,6 +1281,14 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         return 0;
     }
 
+    // Whether dir is inside a git checkout (a .git folder, or the .git file of a worktree, here or above).
+    static bool InGitCheckout(string dir)
+    {
+        for (var d = new DirectoryInfo(dir); d != null; d = d.Parent)
+            if (Directory.Exists(Path.Combine(d.FullName, ".git")) || File.Exists(Path.Combine(d.FullName, ".git"))) return true;
+        return false;
+    }
+
     static int ConfigCmd(string[] a)
     {
         string file = Path.Combine(Here, "effortless.conf");
@@ -1289,6 +1297,12 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             if (a.Length < 2 || !Regex.IsMatch(a[1], "^EFFORTLESS_[A-Z_]+$")) { Out("用法：config set EFFORTLESS_XXX 值\n"); return 2; }
             string k = a[1], v = string.Join(" ", a.Skip(2));
             if (v.Contains("\n") || v.Contains("\r")) { Out("值里不能有换行\n"); return 2; }
+            // A key never goes into a conf a git checkout tracks: run the installed copy, or set it as an environment variable.
+            if (k.EndsWith("KEY") && v != "" && InGitCheckout(Here))
+            {
+                Out("不写入：" + file + " 在 git 仓库里，key 不能进仓库。请用安装后的 %USERPROFILE%\\.codex\\effortless\\effortless.exe 设置，或改用环境变量。\n");
+                return 2;
+            }
             string text = ReadText(file) ?? "";
             string line = k + "=${" + k + ":-" + v + "}";
             var re = new Regex("(?m)^\\s*" + Regex.Escape(k) + "=.*$");

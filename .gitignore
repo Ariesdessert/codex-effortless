@@ -5,3 +5,6 @@ data/
 # Personal settings with a key in them, if you keep a copy here
 *.local.conf
 .env
+# A build run next to its source writes its conf (and keys) there
+windows/effortless.conf
+windows/*.exe

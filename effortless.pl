@@ -1019,6 +1019,16 @@ sub cmd_save {
   out('省钱模式已开启：Auto 最高只到 medium，直到 ' . clock_of($until) . "（额度重置）。\n");
 }
 
+# Whether $dir is inside a git checkout (a .git folder, or the .git file of a worktree, here or above).
+sub in_git_checkout {
+  my $dir = shift;
+  while ($dir ne '' && $dir ne '/') {
+    return 1 if -e "$dir/.git";
+    $dir = dirname($dir);
+  }
+  return 0;
+}
+
 sub cmd_config {
   my ($op, $k, @v) = @_;
   my $file = "$HERE/effortless.conf";
@@ -1026,6 +1036,9 @@ sub cmd_config {
     die "用法：config set EFFORTLESS_XXX 值\n" unless ($k // '') =~ /^EFFORTLESS_[A-Z_]+$/;
     my $v = join ' ', @v;
     die "值里不能有换行\n" if $v =~ /[\r\n]/;
+    # A key never goes into a conf a git checkout tracks: run the installed copy, or set it as an environment variable.
+    die "不写入：$file 在 git 仓库里，key 不能进仓库。请用安装后的 ~/.codex/effortless/effortless.pl 设置，或改用环境变量。\n"
+      if $k =~ /KEY$/ && $v ne '' && in_git_checkout($HERE);
     my $text = slurp($file) // '';
     my $line = "$k=\${$k:-$v}";
     $text =~ s/^\s*\Q$k\E=.*$/$line/m or $text .= ($text =~ /\n\z/ || $text eq '' ? '' : "\n") . "$line\n";
