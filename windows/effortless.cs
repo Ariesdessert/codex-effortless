@@ -35,7 +35,7 @@ static class Effortless
     static string Here, CodexHome, Data, LogPath;
     [ThreadStatic] static string Session;
     static readonly Dictionary<string, string> Conf = new Dictionary<string, string>();
-    static string MODE, JUDGE, MODEL, MIN, MAX, JEV_URL,
+    static string MODE, JUDGE, MODEL, MIN, MAX, JEV_URL, OR_URL, OR_MODEL,
         COLD, HANDOFF_FROM, HANDOFF_SKILL, HANDOFF_AFTER, BAR, UPDATE_CHECK, CODEX;
     static int BIAS, BLOCK_GAP, BUDGET, HANDOFF_EVERY;
     static double SWAMP_AT, COLD_MINUTES, COLD_TOKENS, HOT_AT;
@@ -71,6 +71,8 @@ static class Effortless
         BLOCK_GAP = I(S("EFFORTLESS_BLOCK_GAP", "1"));
         BUDGET = I(S("EFFORTLESS_TIMEOUT", "20"));
         JEV_URL = S("EFFORTLESS_JEV_URL", Env("JEV_URL") ?? "https://api.typesafe.ai/v1/systemone");
+        OR_URL = S("EFFORTLESS_OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions");
+        OR_MODEL = S("EFFORTLESS_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite");
         SWAMP_AT = D(S("EFFORTLESS_SWAMP_AT", "50"));
         COLD = S("EFFORTLESS_COLD", "block");
         COLD_MINUTES = D(S("EFFORTLESS_COLD_MINUTES", "30"));
@@ -666,13 +668,38 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         if (sure != null && Num(sure, 1) < 0.5) return new Verdict { Unsure = true, Tokens = tokens };
         return new Verdict { Effort = effort, Sure = sure != null ? Num(sure, 0) : (double?)null, Why = sure != null ? string.Format(Inv, "{0}% sure", (int)(Num(sure, 0) * 100 + 0.5)) : "", Tokens = tokens };
     }
-    static string JevFailure(int c)
+    static string JevFailure(int c, string name = "Jev")
     {
-        if (c == 0) return "Jev 没有及时回答";
-        if (c == 401 || c == 403) return "Jev 拒绝了 key（" + c + "）";
-        if (c == 402) return "Jev 额度用完了（" + c + "）";
-        if (c == 429) return "Jev 限流了（" + c + "）";
-        return "Jev 出错了（" + c + "）";
+        if (c == 0) return name + " 没有及时回答";
+        if (c == 401 || c == 403) return name + " 拒绝了 key（" + c + "）";
+        if (c == 402) return name + " 额度用完了（" + c + "）";
+        if (c == 429) return name + " 限流了（" + c + "）";
+        return name + " 出错了（" + c + "）";
+    }
+
+    static string OpenRouterKey()
+    {
+        string k = S("EFFORTLESS_OPENROUTER_KEY", "");
+        if (k != "") return k;
+        k = Env("OPENROUTER_API_KEY") ?? Environment.GetEnvironmentVariable("OPENROUTER_API_KEY", EnvironmentVariableTarget.User);
+        return string.IsNullOrEmpty(k) ? null : k;
+    }
+
+    // A model on OpenRouter, asked Luna's question with Luna's JSON reply. Below even odds it is unsure: Luna decides then.
+    static Verdict AskOpenRouter(string key, string prompt, string current, string context, double percent)
+    {
+        var body = Obj("model", OR_MODEL, "max_tokens", 160, "temperature", 0,
+            "messages", new object[] { Obj("role", "system", "content", JUDGE_SYSTEM), Obj("role", "user", "content", JudgeQuestion(prompt, current, context, percent)) });
+        var r = Post(OR_URL, new[] { "Authorization: Bearer " + key, "X-Title: effortless" }, Ser(body), 4);
+        if (r.Key != 200) return new Verdict { Down = JevFailure(r.Key, "OpenRouter") };
+        object j = null;
+        try { j = Parse(r.Value); } catch { }
+        object[] choices = Arr(Get(j, "choices"));
+        Verdict v = ParseVerdict(choices.Length > 0 ? Str(Get(choices[0], "message", "content")) : null);
+        if (v == null) return new Verdict { Down = "OpenRouter 回复无法读取" };
+        v.Tokens = (long)(Num(Get(j, "usage", "prompt_tokens"), 0) + Num(Get(j, "usage", "completion_tokens"), 0));
+        if (v.Sure.HasValue && v.Sure.Value < 0.5) return new Verdict { Unsure = true, Tokens = v.Tokens };
+        return v;
     }
 
     static Dictionary<string, object> JsonIn(string text)
@@ -758,7 +785,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     }
 
     // One prompt through the pipeline every caller shares (the hook, Auto, the bench): a level named in the prompt
-    // ("max effort") runs as asked, a follow-up keeps the effort, else Jev (when set) and then Luna judge. With handoff
+    // ("max effort") runs as asked, a follow-up keeps the effort, else OpenRouter or Jev (when set) and then Luna judge. With handoff
     // evidence, the handoff question goes along with Luna's.
     static Decision Decide(string prompt, string current, string lastUser, string lastAssistant, double percent, List<string> supported,
         string attachments, string handoff, bool onlyHandoff)
@@ -783,7 +810,15 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             r.Effort = r.Raw = current; r.Sure = 1; r.Why = ""; r.Action = "follow-up";
             if (handoff == null) return r;
         }
-        string key = r.Action == null && JUDGE != "luna" ? JevKey() : null;
+        if (r.Action == null && JUDGE == "openrouter")
+        {
+            string okey = OpenRouterKey();
+            Verdict o = okey != null ? AskOpenRouter(okey, asked, current, context, percent) : new Verdict { Down = "OpenRouter 没有 key" };
+            r.Tokens += o.Tokens;
+            if (o.Down != null) r.Down = o.Down;
+            if (o.Effort != null) { by = "openrouter"; r.Raw = o.Effort; r.Sure = o.Sure; r.Why = o.Why; r.Action = "judged"; }
+        }
+        string key = r.Action == null && JUDGE != "luna" && JUDGE != "openrouter" ? JevKey() : null;
         if (key != null)
         {
             Verdict j = AskJev(key, asked, current, context);
@@ -819,7 +854,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         r.Effort = r.Action == "judged" ? ShapeEffort(r.Raw, r.Sure, supported) : (r.Effort ?? current);
         return r;
     }
-    static string JudgeName(string b) { return b == "jev" ? "Jev" : b == "named" ? "你" : "Luna"; }
+    static string JudgeName(string b) { return b == "jev" ? "Jev" : b == "openrouter" ? "OpenRouter" : b == "named" ? "你" : "Luna"; }
     // The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why. Jev's reason already is its confidence.
     static string ReasonLine(string by, double? sure, string why)
     {
@@ -1203,7 +1238,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         var sb = new StringBuilder();
         sb.AppendFormat("codex-effortless {0}（{1}）\n", VERSION, Here);
         sb.AppendFormat(Inv, "设置：MODE={0} JUDGE={1} MODEL={2} MIN={3} MAX={4} BIAS={5} COLD={6}/{7}分钟 SWAMP_AT={8} HOT_AT={9} HANDOFF_FROM={10}\n", MODE, JUDGE, MODEL, MIN, MAX, BIAS, COLD, COLD_MINUTES, SWAMP_AT, HOT_AT, HANDOFF_FROM);
-        sb.Append("判断器：Codex 登录上的 " + MODEL + (JevKey() != null ? "；Jev 先答" : "") + "\n");
+        sb.Append("判断器：Codex 登录上的 " + MODEL + (JUDGE == "openrouter" ? "；OpenRouter 上的 " + OR_MODEL + " 先答" + (OpenRouterKey() != null ? "" : "（没有 key）") : JevKey() != null ? "；Jev 先答" : "") + "\n");
         sb.Append("Auto：" + (AutoOn() ? "开" : "关（$effortless auto 打开）") + "；省钱模式：" + (Saving() ? "开" : "关") + "\n");
         string cli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
         sb.Append("Codex Desktop 的 Auto：" + (cli != null && cli.EndsWith("effortless.exe", StringComparison.OrdinalIgnoreCase) ? "开（CODEX_CLI_PATH 指向 effortless.exe）" : "关（effortless desktop on 打开）") + "\n");
@@ -1259,7 +1294,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             var re = new Regex("(?m)^\\s*" + Regex.Escape(k) + "=.*$");
             text = re.IsMatch(text) ? re.Replace(text, line.Replace("$", "$$"), 1) : text + (text == "" || text.EndsWith("\n") ? "" : "\n") + line + "\n";
             WriteText(file, text);
-            Out("已设置 " + k + "=" + v + "\n");
+            Out("已设置 " + k + "=" + (k.EndsWith("KEY") && v != "" ? "（不显示）" : v) + "\n");
             return 0;
         }
         var sb = new StringBuilder();
@@ -1421,7 +1456,7 @@ Give only the final state of anything that changed during the chat. Point to spe
         if (j == null) { Out("找不到 bench\\judge-cases.json\n"); return 1; }
         // Cases about effort relative to Claude models do not carry over to Codex models.
         var cases = Arr(Get(j, "cases")).Where(c => Str(Get(c, "kind")) != "model-relative").ToArray();
-        Out(string.Format(Inv, "{0} 个用例，判断器：{1}。每个约几秒，请稍候…\n", cases.Length, JevKey() != null ? "Jev + Luna" : "Luna"));
+        Out(string.Format(Inv, "{0} 个用例，判断器：{1}。每个约几秒，请稍候…\n", cases.Length, JUDGE == "openrouter" && OpenRouterKey() != null ? "OpenRouter + Luna" : JUDGE != "openrouter" && JevKey() != null ? "Jev + Luna" : "Luna"));
         var answers = new Decision[cases.Length];
         int next = -1;
         var workers = Enumerable.Range(0, 4).Select(w => new Thread(() =>
