@@ -1,12 +1,12 @@
 #!/usr/bin/env perl
-# codex-effortless for Codex on Linux, macOS and WSL. One script, only core Perl modules (and curl for Jev or OpenRouter):
+# codex-effortless for Codex on Linux, macOS and WSL. One script, only core Perl modules (and curl for OpenRouter):
 #
 #   effortless.pl hook            the UserPromptSubmit hook (judge.sh runs this)
 #   effortless.pl codex [args]    start the Codex CLI with Auto: every prompt runs at the effort the judge picks
 #   effortless.pl stats | debug | auto [on|off] | save [on|off] | config [set KEY VALUE] | test [prompt]
 #   effortless.pl handoff-save | handoff-show | handoff-write | copy | bench | update | version
 #
-# GPT-5.6 Luna on your Codex login (or Jev on TypeSafe, or a model on OpenRouter, first when you have a key) reads each
+# GPT-5.6 Luna on your Codex login (or a model on OpenRouter, first when you have a key) reads each
 # prompt and picks the reasoning effort. Started through `codex` above, the effort is set for the turn
 # itself; started as plain `codex`, a hook can only say which effort to pick, because Codex hooks cannot
 # set it (openai/codex#40599).
@@ -25,7 +25,7 @@ use IO::Select;
 use IO::Handle;
 use Encode qw(encode_utf8 decode_utf8);
 
-our $VERSION = '0.5.1';
+our $VERSION = '0.5.2';
 my $HERE = dirname(abs_path($0));
 my $HOME = $ENV{HOME} // '';
 my $CODEX_HOME = $ENV{CODEX_HOME} || "$HOME/.codex";
@@ -56,14 +56,15 @@ sub S {
 }
 
 my $MODE = S('EFFORTLESS_MODE', 'auto');            # auto, warn, block, off
-my $JUDGE = S('EFFORTLESS_JUDGE', 'auto');          # auto, luna, jev, openrouter
+my $JUDGE = S('EFFORTLESS_JUDGE', 'auto');          # auto, luna, openrouter
+# jev, from before OpenRouter took Jev's place, is the key judge picked outright.
+$JUDGE = 'openrouter' if $JUDGE eq 'jev';
 my $MODEL = S('EFFORTLESS_MODEL', 'gpt-5.6-luna');
 my $MIN = S('EFFORTLESS_MIN', 'medium');
 my $MAX = S('EFFORTLESS_MAX', 'max');
 my $BIAS = int(S('EFFORTLESS_BIAS', 0));
 my $BLOCK_GAP = int(S('EFFORTLESS_BLOCK_GAP', 1));
 my $BUDGET = int(S('EFFORTLESS_TIMEOUT', 20));
-my $JEV_URL = S('EFFORTLESS_JEV_URL', $ENV{JEV_URL} || 'https://api.typesafe.ai/v1/systemone');
 my $OR_URL = S('EFFORTLESS_OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions');
 my $OR_MODEL = S('EFFORTLESS_OPENROUTER_MODEL', 'google/gemini-2.5-flash-lite');
 my $SWAMP_AT = S('EFFORTLESS_SWAMP_AT', 50);
@@ -275,23 +276,6 @@ EOT
 chomp $HANDOFF_SYSTEM;
 my $HANDOFF_SCHEMA = { type => 'object', additionalProperties => JSON::PP::false, required => ['handoff'],
   properties => { handoff => { type => ['string', 'null'] } } };
-
-my %JEV_EFFORTS = (
-  low => 'quick answer, no tools, no planning',
-  medium => 'normal work: a few tool calls or edits',
-  high => 'hard or large multi-step job: many tool calls, costly mistakes',
-  xhigh => 'very hard: a long investigation',
-  max => 'the hardest research-level work',
-);
-my $JEV_TASK = 'Choose the reasoning effort an agentic coding assistant should use for the next user message. It reads files, '
-  . 'runs tools and edits things, not only code. Pick the cheapest that still does the job well. Judge the scope and the '
-  . 'amount of work, not whether it is code: "go through my whole drive and clean it up" is a big tool-heavy job. '
-  . 'A short follow-up ("yes", "go", "ok", in any language) keeps the current effort. When the message answers a '
-  . "question in the assistant's last reply (picks an option), judge only the work that answer starts, not its length and "
-  . 'not the work before the question: yes/no to one small action, or picking a value for one setting (a log level, a colour), is low; picking which way to build something starts that build, so judge the build; '
-  . 'approving a whole plan takes the effort of that plan; a plain yes to "Then I will build X" means judge X. Pushing back on or adding to a plan under discussion continues that work: keep its effort, never low. Thanks or a closing remark with no new request is low. A '
-  . 'question about how to do something that needs no tools is low. "think hard", "ultrathink" or "be thorough" means '
-  . 'at least high; "quick question" means low.';
 
 # The judge's view of the conversation: the person's previous message, short, and the end of the last reply,
 # where a question with options ("A, B or C?") sits: "B" alone looks like a small job, the reply says what it sets off.
@@ -509,36 +493,9 @@ sub ask_judge {
   return ask_codex($jobs, $BUDGET);
 }
 
-sub jev_key {
-  my $k = S('EFFORTLESS_TYPESAFE_KEY', '');
-  return $k if $k ne '';
-  return $ENV{TYPESAFE_API_KEY} if $ENV{TYPESAFE_API_KEY};
-  # Only when Jev was picked outright is ~/.config/jev/.env read: a file holding a secret nobody asked us to use.
-  return undef unless $JUDGE eq 'jev';
-  my $t = slurp("$HOME/.config/jev/.env") // '';
-  return $t =~ /^\s*TYPESAFE_API_KEY\s*=\s*['"]?([^'"\s]+)/m ? $1 : undef;
-}
-
-# Jev on TypeSafe: quick, and answers with its confidence. Below even odds it is unsure: Luna decides then.
-sub ask_jev {
-  my ($key, $prompt, $current, $context) = @_;
-  my $body = { model => 'jev-latest',
-    state => { task => $JEV_TASK, current_effort => $current, recent_conversation => $context, next_message => cut($prompt, 4000) },
-    questions => { effort => { type => 'choice', instructions => 'Which effort fits the next message?', criteria => \%JEV_EFFORTS } } };
-  my ($code, $raw) = curl_finish(curl_start($JEV_URL, ["Authorization: Bearer $key"], $JSON->encode($body), 3));
-  return { down => jev_failure($code) } if $code ne '200';
-  my $j = eval { $JSON->decode($raw) } or return { down => 'Jev 回复无法读取' };
-  my $a = ($j->{answers} // $j->{result}{answers} // {})->{effort} // {};
-  my $effort = $a->{choice} // '';
-  return { down => 'Jev 回复无法读取' } unless grep { $_ eq $effort } @JUDGED;
-  my $sure = $a->{confidence} // $a->{probabilities}{$effort};
-  my $tokens = ($j->{usage}{input_tokens} // 0) + ($j->{usage}{output_tokens} // 0);
-  return { unsure => 1, tokens => $tokens } if defined $sure && $sure < 0.5;
-  return { effort => $effort, sure => $sure, why => defined $sure ? sprintf('%d%% sure', $sure * 100 + 0.5) : '', tokens => $tokens };
-}
-sub jev_failure {
+sub judge_failure {
   my ($c, $name) = @_;
-  $name //= 'Jev';
+  $name //= 'OpenRouter';
   return "$name 没有及时回答" if $c eq '000';
   return "$name 拒绝了 key（$c）" if $c eq '401' || $c eq '403';
   return "$name 额度用完了（$c）" if $c eq '402';
@@ -546,18 +503,20 @@ sub jev_failure {
   return "$name 出错了（$c）";
 }
 
+# The OpenRouter key: EFFORTLESS_OPENROUTER_KEY in the conf, else OPENROUTER_API_KEY.
 sub openrouter_key {
   my $k = S('EFFORTLESS_OPENROUTER_KEY', '');
   return $k ne '' ? $k : $ENV{OPENROUTER_API_KEY} || undef;
 }
 
 # A model on OpenRouter, asked Luna's question with Luna's JSON reply. Below even odds it is unsure: Luna decides then.
+# Nothing usable after 4 s, an error or no JSON: Luna decides too, and the person is told why once.
 sub ask_openrouter {
   my ($key, $prompt, $current, $context, $percent) = @_;
   my $body = { model => $OR_MODEL, max_tokens => 160, temperature => 0,
     messages => [{ role => 'system', content => $JUDGE_SYSTEM }, { role => 'user', content => judge_question($prompt, $current, $context, $percent) }] };
   my ($code, $raw) = curl_finish(curl_start($OR_URL, ["Authorization: Bearer $key", 'X-Title: effortless'], $JSON->encode($body), 4));
-  return { down => jev_failure($code, 'OpenRouter') } if $code ne '200';
+  return { down => judge_failure($code) } if $code ne '200';
   my $j = eval { $JSON->decode($raw) } or return { down => 'OpenRouter 回复无法读取' };
   my $v = parse_verdict(eval { $j->{choices}[0]{message}{content} }) or return { down => 'OpenRouter 回复无法读取' };
   my $tokens = ($j->{usage}{prompt_tokens} // 0) + ($j->{usage}{completion_tokens} // 0);
@@ -635,7 +594,7 @@ sub saving {
 sub auto_on { !-e "$DATA/auto-off" }
 
 # One prompt through the pipeline every caller shares (the hook, Auto, the bench): a level named in the prompt
-# ("max effort") runs as asked, a follow-up keeps the effort, else OpenRouter or Jev (when set) and then Luna judge. With $handoff,
+# ("max effort") runs as asked, a follow-up keeps the effort, else OpenRouter (when set) and then Luna judge. With $handoff,
 # the handoff question goes along with Luna's.
 # Gives {effort (shaped), raw, sure, why, by, ms, tokens, action, down, handoff}.
 sub decide {
@@ -658,19 +617,12 @@ sub decide {
     %r = (%r, effort => $current, raw => $current, sure => 1, why => '', action => 'follow-up');
     return \%r unless $a{handoff};
   }
-  if (!$r{action} && $JUDGE eq 'openrouter') {
-    my $okey = openrouter_key();
-    my $j = $okey ? ask_openrouter($okey, $prompt, $current, $context, $a{percent}) : { down => 'OpenRouter 没有 key' };
+  my $key = $JUDGE ne 'luna' ? openrouter_key() : undef;
+  if (!$r{action} && $key) {
+    my $j = ask_openrouter($key, $prompt, $current, $context, $a{percent});
     $r{tokens} += $j->{tokens} // 0;
     $r{down} = $j->{down} if $j->{down};
     if ($j->{effort}) { $by = 'openrouter'; %r = (%r, raw => $j->{effort}, sure => $j->{sure}, why => $j->{why}, action => 'judged') }
-  }
-  my $key = $JUDGE ne 'luna' && $JUDGE ne 'openrouter' ? jev_key() : undef;
-  if (!$r{action} && $key) {
-    my $j = ask_jev($key, $prompt, $current, $context);
-    $r{tokens} += $j->{tokens} // 0;
-    $r{down} = $j->{down} if $j->{down};
-    if ($j->{effort}) { $by = 'jev'; %r = (%r, raw => $j->{effort}, sure => $j->{sure}, why => $j->{why}, action => 'judged') }
   }
   my @jobs;
   my ($effort_job, $handoff_job);
@@ -915,11 +867,11 @@ sub hook {
   exit 0;
 }
 
-sub judge_name { my $b = shift // q{}; $b eq q{jev} ? q{Jev} : $b eq q{openrouter} ? q{OpenRouter} : $b eq q{named} ? q{你} : q{Luna} }
-# The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why. Jev's reason already is its confidence.
+sub judge_name { my $b = shift // q{}; $b eq q{openrouter} ? q{OpenRouter} : $b eq q{named} ? q{你} : q{Luna} }
+# The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why.
 sub reason_line {
   my ($by, $sure, $why) = @_;
-  my $pct = ($by // q{}) ne q{named} && defined $sure && ($why // q{}) !~ /% sure/ ? sprintf(' %d%%', $sure * 100 + 0.5) : q{};
+  my $pct = ($by // q{}) ne q{named} && defined $sure ? sprintf(' %d%%', $sure * 100 + 0.5) : q{};
   return judge_name($by) . $pct . (length($why // q{}) ? "：$why" : q{});
 }
 
@@ -992,7 +944,7 @@ sub cmd_stats {
 sub cmd_debug {
   out("codex-effortless $VERSION（$HERE）\n");
   out("设置：MODE=$MODE JUDGE=$JUDGE MODEL=$MODEL MIN=$MIN MAX=$MAX BIAS=$BIAS COLD=$COLD/${COLD_MINUTES}分钟 SWAMP_AT=$SWAMP_AT HOT_AT=$HOT_AT HANDOFF_FROM=$HANDOFF_FROM\n");
-  out("判断器：Codex 登录上的 $MODEL" . ($JUDGE eq 'openrouter' ? "；OpenRouter 上的 $OR_MODEL 先答" . (openrouter_key() ? '' : '（没有 key）') : jev_key() ? '；Jev 先答' : '') . "\n");
+  out("判断器：Codex 登录上的 $MODEL" . ($JUDGE ne 'luna' && openrouter_key() ? "；OpenRouter 上的 $OR_MODEL 先答" : '') . "\n");
   out('Auto：' . (auto_on() ? '开' : '关（$effortless auto 打开）') . '；省钱模式：' . (saving() ? '开' : '关') . "\n");
   my $codex = $CODEX =~ m{/} ? $CODEX : `command -v '$CODEX' 2>/dev/null`;
   out('codex：' . ($CODEX_OK && trim($codex) || "找不到。$NO_CODEX") . "\n");
@@ -1198,7 +1150,7 @@ sub cmd_bench {
   my $j = read_json($file) or die "找不到 bench/judge-cases.json\n";
   # Cases about effort relative to Claude models do not carry over to Codex models.
   my @cases = grep { $_->{kind} ne 'model-relative' } @{ $j->{cases} };
-  out(sprintf("%d 个用例，判断器：%s。每个约几秒，请稍候…\n", scalar @cases, $JUDGE eq 'openrouter' && openrouter_key() ? q{OpenRouter + Luna} : $JUDGE ne 'openrouter' && jev_key() ? q{Jev + Luna} : q{Luna}));
+  out(sprintf("%d 个用例，判断器：%s。每个约几秒，请稍候…\n", scalar @cases, $JUDGE ne 'luna' && openrouter_key() ? q{OpenRouter + Luna} : q{Luna}));
   my (@answers, %kids);
   my $par = 4;
   for my $i (0 .. $#cases) {

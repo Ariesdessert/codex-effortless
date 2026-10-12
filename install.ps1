@@ -130,16 +130,11 @@ $cfg = Join-Path $CodexHome 'config.toml'
 if (-not $Quiet) {
   ''
   'Setup (Enter keeps the choice in brackets; change any of it later with $effortless settings):'
-  $j = Read-Host '  Judge: 1 Luna on your Codex login, 2 add Jev (TypeSafe key), 3 add OpenRouter (OpenRouter key) [1]'
+  $j = Read-Host '  Judge: 1 Luna on your Codex login, 2 add OpenRouter (OpenRouter key) [1]'
   if ($j -eq '2') {
-    $k = Read-Host '  TypeSafe key (not shown; saved in effortless.conf in your profile)' -AsSecureString
-    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($k))
-    if ($plain) { & $Exe config set EFFORTLESS_TYPESAFE_KEY $plain | Out-Null }
-  }
-  if ($j -eq '3') {
     $k = Read-Host '  OpenRouter key (not shown; saved in effortless.conf in your profile)' -AsSecureString
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($k))
-    if ($plain) { & $Exe config set EFFORTLESS_OPENROUTER_KEY $plain | Out-Null; & $Exe config set EFFORTLESS_JUDGE openrouter | Out-Null }
+    if ($plain) { & $Exe config set EFFORTLESS_OPENROUTER_KEY $plain | Out-Null }
   }
   $b = Read-Host '  Lean: -2 cheapest ... 0 balanced ... 2 smartest [0]'
   if ($b) { & $Exe config set EFFORTLESS_BIAS $b | Out-Null }
