@@ -26,6 +26,10 @@ Changing the effort yourself pauses Auto for that chat and says so: you always w
 Codex on Windows and Codex inside WSL keep separate settings (`%USERPROFILE%\.codex` and `~/.codex`), so install on
 each side you use. Both read the same `effortless.conf` format.
 
+effortless finds `codex` on PATH, or where OpenAI's installer puts it (`~/.local/bin`, or
+`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` on Windows) when a hook or Desktop starts with a PATH that lacks it. With no
+Codex CLI anywhere it says how to install one.
+
 **Linux, macOS, WSL** (needs `codex`, `perl` with its core modules, and `curl` for Jev or OpenRouter):
 
 ```bash

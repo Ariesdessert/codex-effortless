@@ -63,7 +63,9 @@ if [ "$MODE" != install ]; then
   exit 0
 fi
 
-command -v codex >/dev/null || { echo "codex is not on PATH."; exit 1; }
+# effortless.pl also finds codex where OpenAI's installer puts it when PATH does not have it.
+command -v codex >/dev/null || [ -x "$HOME/.local/bin/codex" ] || [ -x "$CODEX_HOME/packages/standalone/current/bin/codex" ] ||
+  { echo "This needs the Codex CLI. Install it with: curl -fsSL https://chatgpt.com/codex/install.sh | sh"; exit 1; }
 perl -MJSON::PP -MDigest::SHA -e1 2>/dev/null || { echo "perl with JSON::PP and Digest::SHA is required (core modules)."; exit 1; }
 command -v curl >/dev/null || echo "Note: curl is not installed; only needed for Jev or OpenRouter."
 

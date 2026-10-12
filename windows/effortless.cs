@@ -26,7 +26,7 @@ using System.Web.Script.Serialization;
 
 static class Effortless
 {
-    const string VERSION = "0.5.0";
+    const string VERSION = "0.5.1";
     static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     static readonly string[] LEVELS = { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" };
@@ -434,7 +434,10 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     class Job { public string System, Ask, Effort; public object Schema; }   // no Schema: free text; Effort none unless set
     class Answer { public string Text; public long Tokens; }
 
-    // Finds codex.exe: the setting, then PATH, then the npm package, then Codex Desktop's own.
+    const string NO_CODEX = "需要 Codex CLI，在 PowerShell 里安装：irm https://chatgpt.com/codex/install.ps1 | iex";
+
+    // Finds codex.exe: the setting, then PATH, then where OpenAI's installer puts it, then the npm package, then Codex
+    // Desktop's own. Desktop keeps the PATH it had at login, so a CLI installed since is not on it yet.
     static string FindCodex()
     {
         if (CODEX != "" && File.Exists(CODEX)) return CODEX;
@@ -448,6 +451,10 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             }
             catch { }
         }
+        foreach (string c in new[] {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\OpenAI\Codex\bin\codex.exe"),
+            Path.Combine(CodexHome, @"packages\standalone\current\bin\codex.exe") })
+            if (File.Exists(c)) return c;
         string npm = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), @"npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe");
         if (File.Exists(npm)) return npm;
         return DesktopCodex();
@@ -843,7 +850,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
                 {
                     r.Action = "fail";
                     r.Fail = by + ":" + (answers[effortJob] != null ? "verdict" : (string.IsNullOrEmpty(failed) ? "turn" : failed));
-                    if (answers[effortJob] == null && r.Down == null) r.Down = "判断器没有及时回答，档位保持不变";
+                    if (answers[effortJob] == null && r.Down == null) r.Down = (failed == "no-codex" ? "找不到 codex，判断器没法运行（" + NO_CODEX + "）" : "判断器没有及时回答") + "，档位保持不变";
                 }
             }
             else by = judgeBy;
@@ -1242,7 +1249,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         sb.Append("Auto：" + (AutoOn() ? "开" : "关（$effortless auto 打开）") + "；省钱模式：" + (Saving() ? "开" : "关") + "\n");
         string cli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
         sb.Append("Codex Desktop 的 Auto：" + (cli != null && cli.EndsWith("effortless.exe", StringComparison.OrdinalIgnoreCase) ? "开（CODEX_CLI_PATH 指向 effortless.exe）" : "关（effortless desktop on 打开）") + "\n");
-        sb.Append("codex：" + (FindCodex() ?? "找不到") + "\n");
+        sb.Append("codex：" + (FindCodex() ?? "找不到。" + NO_CODEX) + "\n");
         string path = LastTranscript();
         if (path != null)
         {
@@ -1440,7 +1447,7 @@ Give only the final state of anything that changed during the chat. Point to spe
             Ask = text + "\n\n---\n" + HANDOFF_PROMPT, Effort = "medium" } }, 150);
         string got = answers[0] == null ? "" : (answers[0].Text ?? "").Trim();
         got = Regex.Replace(got, @"^\[effortless-judge\]\s*", "");
-        if (got.Length < 100) return fail(failed == "no-codex" || failed == "spawn" ? "找不到 codex" : "没有及时写完");
+        if (got.Length < 100) return fail(failed == "no-codex" || failed == "spawn" ? "找不到 codex。" + NO_CODEX : "没有及时写完");
         WriteText(Path.Combine(Data, "handoff.md"), got + "\n");
         try { File.Delete(marker); } catch { }
         if (HANDOFF_AFTER == "copy") CopyText(got);
@@ -1530,7 +1537,7 @@ Give only the final state of anything that changed during the chat. Point to spe
         if (arg == "on")
         {
             if (now != null && !ours) { Out("CODEX_CLI_PATH 已经指向 " + now + "，没有改动。要换成 effortless，先删掉它，或把 EFFORTLESS_CODEX 设成它。\n"); return 1; }
-            if (DesktopCodex() == null && FindCodex() == null) { Out("找不到 Codex Desktop 或 codex.exe。\n"); return 1; }
+            if (DesktopCodex() == null && FindCodex() == null) { Out("找不到 Codex Desktop 或 codex.exe。" + NO_CODEX + "\n"); return 1; }
             Environment.SetEnvironmentVariable("CODEX_CLI_PATH", self, EnvironmentVariableTarget.User);
             Out("Codex Desktop 的 Auto 已打开：重启 Codex Desktop（托盘里也退出）后生效。\n关闭：effortless desktop off。\n");
         }
@@ -1861,7 +1868,7 @@ Give only the final state of anything that changed during the chat. Point to spe
     {
         if (args.Any(a => a.StartsWith("--remote"))) { Console.Error.WriteLine("effortless: leave --remote out; the proxy sets it"); return 2; }
         string exe = FindCodex();
-        if (exe == null) { Console.Error.WriteLine("effortless: cannot find codex.exe (set EFFORTLESS_CODEX)"); return 1; }
+        if (exe == null) { Console.Error.WriteLine("effortless: cannot find codex.exe (set EFFORTLESS_CODEX). Install the Codex CLI in PowerShell with: irm https://chatgpt.com/codex/install.ps1 | iex"); return 1; }
         byte[] tok = new byte[32];
         using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(tok);
         string token = string.Concat(tok.Select(b => b.ToString("x2")));
