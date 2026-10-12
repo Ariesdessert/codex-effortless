@@ -20,12 +20,13 @@ use Time::Local qw(timegm);
 use Digest::MD5 qw(md5_hex);
 use File::Path qw(make_path);
 use File::Basename qw(dirname);
-use Cwd qw(abs_path);
+use File::Glob qw(bsd_glob);
+use Cwd qw(abs_path getcwd);
 use IO::Select;
 use IO::Handle;
 use Encode qw(encode_utf8 decode_utf8);
 
-our $VERSION = '0.5.3';
+our $VERSION = '0.5.4';
 my $HERE = dirname(abs_path($0));
 my $HOME = $ENV{HOME} // '';
 my $CODEX_HOME = $ENV{CODEX_HOME} || "$HOME/.codex";
@@ -64,7 +65,7 @@ my $BIAS = int(S('EFFORTLESS_BIAS', 0));
 my $BLOCK_GAP = int(S('EFFORTLESS_BLOCK_GAP', 1));
 my $BUDGET = int(S('EFFORTLESS_TIMEOUT', 20));
 my $JEV_URL = S('EFFORTLESS_JEV_URL', $ENV{JEV_URL} || 'https://api.typesafe.ai/v1/systemone');
-my $SWAMP_AT = S('EFFORTLESS_SWAMP_AT', 50);
+my $SWAMP_AT = S('EFFORTLESS_SWAMP_AT', 70);
 my $COLD = S('EFFORTLESS_COLD', 'block');           # block, warn, off
 my $COLD_MINUTES = S('EFFORTLESS_COLD_MINUTES', 30);
 my $COLD_TOKENS = S('EFFORTLESS_COLD_TOKENS', 150000);
@@ -338,6 +339,31 @@ sub named_effort {
     $word = lc $word;
     $word =~ s/\s+/ /;
     return $LEVEL_OF{$word};
+  }
+  return undef;
+}
+
+# "$effortless stats" and the like: effortless's own commands, never judged.
+sub own_command { (shift // '') =~ /^\s*\$effortless\b/i }
+
+# The skill a typed "$name args" runs ({name, description}), or nothing: looked up where Codex keeps skills (yours,
+# the system ones, ~/.agents, the project's, plugins'). A plugin's "$plugin:skill" is found by its last part.
+sub typed_skill {
+  my ($text, $cwd) = @_;
+  my ($name) = ($text // '') =~ /^\s*\$([A-Za-z0-9][\w.:-]*)/ or return undef;
+  return undef if lc $name eq 'effortless';
+  $name =~ s/^.*://;
+  my @roots = ("$CODEX_HOME/skills", "$CODEX_HOME/skills/.system", "$HOME/.agents/skills",
+    ($cwd ? ("$cwd/.agents/skills", "$cwd/.codex/skills") : ()), bsd_glob("$CODEX_HOME/plugins/cache/*/*/*/skills"));
+  for my $root (@roots) {
+    for my $file (bsd_glob("$root/*/SKILL.md")) {
+      my $head = decode_utf8(slurp($file) // '', Encode::FB_DEFAULT);
+      my ($front) = $head =~ /\A---\s*\n(.*?)\n---/s or next;
+      my ($called) = $front =~ /^name:\s*["']?(.*?)["']?\s*$/m;
+      next unless ($called // '') eq $name || (split m{/}, dirname($file))[-1] eq $name;
+      my ($what) = $front =~ /^description:\s*["']?(.*?)["']?\s*$/m;
+      return { name => $name, description => cut(trim($what // ''), 400) };
+    }
   }
   return undef;
 }
@@ -622,8 +648,16 @@ sub decide {
   my $context = context_text($a{last_user}, $a{last_assistant});
   my $started = now();
   my %r = (tokens => 0);
+  # effortless's own commands are never judged: the effort stays, and no handoff question goes along.
+  if (!$a{only_handoff} && own_command($a{prompt})) {
+    return { %r, effort => $current, raw => $current, why => '', action => 'command', ms => 0 };
+  }
   my $prompt = $a{prompt};
   $prompt .= "\n\n[The message comes with $a{attachments} to look at.]" if $a{attachments};
+  # A typed $skill: its name alone says little, so the judge is told what the skill does.
+  if (!$a{only_handoff} && (my $skill = typed_skill($a{prompt}, $a{cwd}))) {
+    $prompt .= "\n\n[This message runs a skill: " . ($skill->{description} || $skill->{name}) . " Judge the work the skill will do.]";
+  }
   my $named = !$a{only_handoff} && $a{prompt} !~ m{^\s*[\$/]} ? named_effort($a{prompt}) : undef;
   if ($a{only_handoff}) {
     %r = (%r, effort => $current, action => q{skip});
@@ -671,6 +705,27 @@ sub decide {
   $r{by} = $by;
   $r{effort} = $r{action} eq 'judged' ? shape_effort($r{raw}, $r{sure}, $a{supported}) : ($r{effort} // $current);
   return \%r;
+}
+
+# ---------------------------------------------------------------- the alerts' words (the hook and the previews share them)
+
+# A chat gone cold; $held: the prompt is held back once (COLD=block), else it is a note.
+sub cold_text {
+  my ($idle, $tokens, $held) = @_;
+  my $msg = sprintf('effortless: 对话已冷（闲置 %d 分钟），这条消息会按全价重读约 %s tokens。', $idle, ktokens($tokens));
+  return $held ? "${msg}想省就先 /compact 或 \$effortless handoff；原文还在输入框里，直接回车重发就照常发送。"
+               : "${msg}下次闲置这么久后，先 /compact 或 \$effortless handoff 更省。";
+}
+sub swamp_text {
+  my ($percent, $tokens) = @_;
+  return sprintf('effortless: 对话臃肿 — 上下文已用 %d%%（约 %s tokens），每条消息都要重读这些内容。可以 /compact 或 $effortless handoff。', $percent + 0.5, ktokens($tokens));
+}
+# A usage window running hot: {minutes, pct, resets}.
+sub hot_text {
+  my $top = shift;
+  my $reset = $top->{resets} ? '，' . clock_of($top->{resets}) . ' 重置' : '';
+  my $save = saving() ? '省钱模式已开（Auto 最高 medium）。' : '输入 $effortless save 开启省钱模式：Auto 最高只到 medium，直到额度重置。';
+  return sprintf('effortless: %s额度已用 %d%%%s。%s', limit_name($top->{minutes}), $top->{pct}, $reset, $save);
 }
 
 # ---------------------------------------------------------------- per-session memory
@@ -748,22 +803,23 @@ sub hook {
   # A chat gone cold: the next message rereads the whole context at full price. Held back once, so /compact or a
   # handoff can come first; sent again (or anything else sent in the same idle spell), it goes through.
   if ($cold && $COLD ne 'off' && !$HIDE{cold} && ($t->{tokens} // 0) >= $COLD_TOKENS && abs(($st->{cold_for} // 0) - $t->{last_at}) >= 0.01) {
-    my $msg = sprintf('effortless: 对话已冷（闲置 %d 分钟），这条消息会按全价重读约 %s tokens。', $idle, ktokens($t->{tokens}));
     if ($COLD eq 'block') {
       $st->{cold_for} = $t->{last_at};
       save_session_state($sid, $st);
       log_row($current, '-', '-', 0, 0, 'cold-block');
-      say_json({ decision => 'block', reason => "${msg}想省就先 /compact 或 \$effortless handoff；原文还在输入框里，直接回车重发就照常发送。" });
+      say_json({ decision => 'block', reason => cold_text($idle, $t->{tokens}, 1) });
       exit 0;
     }
-    push @notes, "${msg}下次闲置这么久后，先 /compact 或 \$effortless handoff 更省。";
+    push @notes, cold_text($idle, $t->{tokens}, 0);
   }
 
   my $routed = read_json("$DATA/routed/$sid");
   $routed = undef unless $routed && now() - ($routed->{at} // 0) < 120;
   my $handoff_due = 0;
   my $percent = $t->{percent} // 0;
-  if ($HANDOFF_FROM ne 'off' && $percent >= $HANDOFF_FROM) {
+  # effortless's own commands do not count towards the next handoff check, nor get one.
+  if (own_command($prompt)) {
+  } elsif ($HANDOFF_FROM ne 'off' && $percent >= $HANDOFF_FROM) {
     $st->{since_check}++;
     if ($st->{since_check} >= $HANDOFF_EVERY) { $handoff_due = 1; $st->{since_check} = 0 }
   } else {
@@ -801,10 +857,10 @@ sub hook {
       log_row($current, '-', '-', 0, 0, 'resent');
     } else {
       $r = decide(prompt => $prompt, current => $current, last_user => $last_user, last_assistant => $t->{last_assistant},
-        percent => $percent, supported => $info && $info->{supported}, handoff => $evidence);
+        percent => $percent, supported => $info && $info->{supported}, handoff => $evidence, cwd => $p->{cwd});
       push @notes, "effortless: $r->{down}" if $r->{down} && !$st->{warned}{ $r->{down} }++;
-      if ($r->{action} eq 'follow-up') {
-        log_row($current, '-', '-', 0, 0, 'follow-up');
+      if ($r->{action} eq 'follow-up' || $r->{action} eq 'command') {
+        log_row($current, '-', '-', 0, 0, $r->{action});
       } elsif ($r->{action} eq 'fail') {
         log_row($current, '-', '-', $r->{ms}, $r->{tokens}, "fail:$r->{fail}");
       } else {
@@ -844,7 +900,7 @@ sub hook {
   if ($percent >= $SWAMP_AT && !$HIDE{swamp}) {
     if (!defined $st->{swamp_at} || $tokens >= $st->{swamp_at} + 50000) {
       if (!$cold) {
-        push @notes, sprintf('effortless: 对话臃肿 — 上下文已用 %d%%（约 %s tokens），每条消息都要重读这些内容。可以 /compact 或 $effortless handoff。', $percent + 0.5, ktokens($tokens));
+        push @notes, swamp_text($percent, $tokens);
         $st->{swamp_at} = $tokens;
       }
     }
@@ -855,9 +911,7 @@ sub hook {
   # Running hot: a usage window past HOT_AT. Said once for that window, in any chat, and once more at $HOT_FINAL%.
   if (my $top = hottest($t)) {
     if ($top->{pct} >= $HOT_AT && !$HIDE{hot} && hot_visible($top, read_json("$DATA/hot-said"))) {
-      my $reset = $top->{resets} ? '，' . clock_of($top->{resets}) . ' 重置' : '';
-      my $save = saving() ? '省钱模式已开（Auto 最高 medium）。' : '输入 $effortless save 开启省钱模式：Auto 最高只到 medium，直到额度重置。';
-      push @notes, sprintf('effortless: %s额度已用 %d%%%s。%s', limit_name($top->{minutes}), $top->{pct}, $reset, $save);
+      push @notes, hot_text($top);
       write_json("$DATA/hot-said", { window => hot_window($top), pct => $top->{pct} });
     }
   }
@@ -981,6 +1035,35 @@ sub cmd_debug {
   }
 }
 
+# $effortless cold, swamp, hot, down: an alert's words now, to see it. With the last chat's numbers when there is one.
+sub cmd_preview {
+  my $kind = shift;
+  my $path = last_transcript();
+  my $t = $path ? read_transcript($path) : {};
+  my $off = $HIDE{$kind} || ($kind eq 'cold' && $COLD eq 'off') ? "（这条提醒现在是关的：EFFORTLESS_HIDE 或 EFFORTLESS_COLD=off）\n" : '';
+  out("预览，不是真的提醒：\n");
+  if ($kind eq 'cold') {
+    my $idle = $t->{last_at} ? (now() - $t->{last_at}) / 60 : 0;
+    $idle = $COLD_MINUTES + 5 if $idle < $COLD_MINUTES;
+    my $tokens = ($t->{tokens} // 0) >= $COLD_TOKENS ? $t->{tokens} : $COLD_TOKENS + 30000;
+    out(cold_text($idle, $tokens, $COLD ne 'warn') . "\n");
+    out($COLD eq 'warn' ? "（作为提示附在回复前，消息照常发送）\n" : "（这条消息会被拦下一次）\n");
+    out("触发条件：闲置 ${COLD_MINUTES} 分钟以上，且上下文不少于 " . ktokens($COLD_TOKENS) . " tokens。\n");
+  } elsif ($kind eq 'swamp') {
+    my $percent = ($t->{percent} // 0) >= $SWAMP_AT ? $t->{percent} : $SWAMP_AT + 5;
+    my $tokens = $t->{window} ? $t->{window} * $percent / 100 : 180000;
+    out(swamp_text($percent, $tokens) . "\n触发条件：上下文用到 ${SWAMP_AT}% 以上，之后每多 50k tokens 再说一次。\n");
+  } elsif ($kind eq 'hot') {
+    my $top = hottest($t) // {};
+    $top = { minutes => $top->{minutes} // 300, resets => $top->{resets}, pct => ($top->{pct} // 0) >= $HOT_AT ? $top->{pct} : $HOT_AT + 5 };
+    out(hot_text($top) . "\n触发条件：任一额度用到 ${HOT_AT}% 以上；同一额度窗口只说一次，到 ${HOT_FINAL}% 再说一次。\n");
+  } else {
+    out('effortless: ' . jev_failure('000') . "\n（Jev 出问题时：Luna 接手判断）\n") if jev_key();
+    out("effortless: 判断器没有及时回答，档位保持不变\n（判断器都没答上时：档位不变，消息照常发送）\n");
+  }
+  out($off);
+}
+
 sub cmd_auto {
   my $arg = shift // 'toggle';
   my $on = $arg eq 'on' ? 1 : $arg eq 'off' ? 0 : $arg eq 'status' ? auto_on() : !auto_on();
@@ -1033,7 +1116,8 @@ sub cmd_config {
 sub cmd_test {
   my $prompt = join(' ', @_) || 'rename one variable in a single file';
   $prompt = decode_utf8($prompt);
-  my $r = decide(prompt => $prompt, current => 'medium');
+  my $r = decide(prompt => $prompt, current => 'medium', cwd => getcwd());
+  if ($r->{action} eq 'command') { out("effortless 自己的命令，不判断，档位保持 $r->{effort}\n"); return }
   if ($r->{action} =~ /^(judged|named)$/) { out(sprintf("%s 回答：%s（%s，%.1f 秒）%s\n", judge_name($r->{by}), $r->{effort}, defined $r->{sure} ? sprintf('%.0f%% 把握', $r->{sure} * 100) : '没说把握', $r->{ms} / 1000, $r->{why} ? " — $r->{why}" : '')) }
   else { out('判断失败：' . ($r->{fail} // $r->{action}) . ($r->{down} ? "（$r->{down}）" : '') . "\n"); exit 1 }
 }
@@ -1480,7 +1564,7 @@ sub start_judge {
     $session = $tid;
     my $d = eval {
       decide(prompt => $text, current => $current, last_user => $s->{last_user}, last_assistant => $s->{last_assistant},
-        attachments => input_attachments($params->{input}), supported => $info->{supported});
+        attachments => input_attachments($params->{input}), supported => $info->{supported}, cwd => $params->{cwd} // getcwd());
     } // { action => 'fail', fail => 'error' };
     print $w $JSON->encode($d);
     close $w;
@@ -1521,6 +1605,7 @@ sub main {
   if ($cmd eq 'hook') { hook() }
   elsif ($cmd eq 'stats' || $cmd eq '--stats') { cmd_stats() }
   elsif ($cmd eq 'debug') { cmd_debug() }
+  elsif ($cmd =~ /^(cold|swamp|hot|down)$/) { cmd_preview($cmd) }
   elsif ($cmd eq 'auto') { cmd_auto(@_) }
   elsif ($cmd eq 'save') { cmd_save(@_) }
   elsif ($cmd eq 'config') { cmd_config(@_) }
