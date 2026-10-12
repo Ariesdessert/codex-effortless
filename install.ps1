@@ -130,7 +130,7 @@ $cfg = Join-Path $CodexHome 'config.toml'
 if (-not $Quiet) {
   ''
   'Setup (Enter keeps the choice in brackets; change any of it later with $effortless settings):'
-  $j = Read-Host '  Judge: 1 Luna on your Codex login, 2 add OpenRouter (OpenRouter key) [1]'
+  $j = Read-Host '  Judge: 1 Luna on your Codex login, 2 add Jev (OpenRouter key) [1]'
   if ($j -eq '2') {
     $k = Read-Host '  OpenRouter key (not shown; saved in effortless.conf in your profile)' -AsSecureString
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($k))
