@@ -22,7 +22,7 @@ SOFTWARE.
 
 ---
 
-Portions (the judge and handoff prompts, the handoff format, and bench/judge-cases.json) are adapted from
+Portions (the judge, Jev and handoff prompts, the handoff format, and bench/judge-cases.json) are adapted from
 effortless, https://github.com/HeyCubit/effortless, under the MIT License:
 
 Copyright (c) 2026 HeyCubit

@@ -26,7 +26,7 @@ using System.Web.Script.Serialization;
 
 static class Effortless
 {
-    const string VERSION = "0.5.2";
+    const string VERSION = "0.5.3";
     static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     static readonly string[] LEVELS = { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" };
@@ -35,7 +35,7 @@ static class Effortless
     static string Here, CodexHome, Data, LogPath;
     [ThreadStatic] static string Session;
     static readonly Dictionary<string, string> Conf = new Dictionary<string, string>();
-    static string MODE, JUDGE, MODEL, MIN, MAX, OR_URL, OR_MODEL,
+    static string MODE, JUDGE, MODEL, MIN, MAX, JEV_URL,
         COLD, HANDOFF_FROM, HANDOFF_SKILL, HANDOFF_AFTER, BAR, UPDATE_CHECK, CODEX;
     static int BIAS, BLOCK_GAP, BUDGET, HANDOFF_EVERY;
     static double SWAMP_AT, COLD_MINUTES, COLD_TOKENS, HOT_AT;
@@ -64,16 +64,13 @@ static class Effortless
         }
         MODE = S("EFFORTLESS_MODE", "auto");
         JUDGE = S("EFFORTLESS_JUDGE", "auto");
-        // openrouter, a name this port used for a while, is Jev.
-        if (JUDGE == "openrouter") JUDGE = "jev";
         MODEL = S("EFFORTLESS_MODEL", "gpt-5.6-luna");
         MIN = S("EFFORTLESS_MIN", "medium");
         MAX = S("EFFORTLESS_MAX", "max");
         BIAS = I(S("EFFORTLESS_BIAS", "0"));
         BLOCK_GAP = I(S("EFFORTLESS_BLOCK_GAP", "1"));
         BUDGET = I(S("EFFORTLESS_TIMEOUT", "20"));
-        OR_URL = S("EFFORTLESS_OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions");
-        OR_MODEL = S("EFFORTLESS_OPENROUTER_MODEL", "google/gemini-2.5-flash-lite");
+        JEV_URL = S("EFFORTLESS_JEV_URL", Env("JEV_URL") ?? "https://api.typesafe.ai/v1/systemone");
         SWAMP_AT = D(S("EFFORTLESS_SWAMP_AT", "50"));
         COLD = S("EFFORTLESS_COLD", "block");
         COLD_MINUTES = D(S("EFFORTLESS_COLD_MINUTES", "30"));
@@ -345,6 +342,16 @@ Reply with JSON only: {""effort"":""low|medium|high|xhigh|max"",""sure"":0.0-1.0
 Say yes only for a clear reason: the task just finished and the next message is something else, the topic has changed so the old context is dead weight, the chat keeps going in circles on the same problem, or a long chat now holds so much unrelated history that a clean start would be sharper. A normal next step of the same work is never a reason, a long chat by itself is not one, and neither is a high context share when the work is going well. When unsure, say no: a wrong yes costs the person more than a missed one.
 
 Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's language""} for yes, or {""handoff"":null} for no.";
+
+    const string JEV_TASK = "Choose the reasoning effort an agentic coding assistant should use for the next user message. It reads files, " +
+        "runs tools and edits things, not only code. Pick the cheapest that still does the job well. Judge the scope and the " +
+        "amount of work, not whether it is code: \"go through my whole drive and clean it up\" is a big tool-heavy job. " +
+        "A short follow-up (\"yes\", \"go\", \"ok\", in any language) keeps the current effort. When the message answers a " +
+        "question in the assistant's last reply (picks an option), judge only the work that answer starts, not its length and " +
+        "not the work before the question: yes/no to one small action, or picking a value for one setting (a log level, a colour), is low; picking which way to build something starts that build, so judge the build; " +
+        "approving a whole plan takes the effort of that plan; a plain yes to \"Then I will build X\" means judge X. Pushing back on or adding to a plan under discussion continues that work: keep its effort, never low. Thanks or a closing remark with no new request is low. A " +
+        "question about how to do something that needs no tools is low. \"think hard\", \"ultrathink\" or \"be thorough\" means " +
+        "at least high; \"quick question\" means low.";
 
     static object EffortSchema()
     {
@@ -632,43 +639,47 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         return AskCodex(jobs, BUDGET);
     }
 
-    class Verdict { public string Effort, Why, Down; public double? Sure; public bool Unsure; public long Tokens; }
-
-    static string JevFailure(int c, string name = "Jev")
-    {
-        if (c == 0) return name + " 没有及时回答";
-        if (c == 401 || c == 403) return name + " 拒绝了 key（" + c + "）";
-        if (c == 402) return name + " 额度用完了（" + c + "）";
-        if (c == 429) return name + " 限流了（" + c + "）";
-        return name + " 出错了（" + c + "）";
-    }
-
-    // Jev's OpenRouter key: EFFORTLESS_OPENROUTER_KEY in the conf, else OPENROUTER_API_KEY.
     static string JevKey()
     {
-        string k = S("EFFORTLESS_OPENROUTER_KEY", "");
+        string k = S("EFFORTLESS_TYPESAFE_KEY", "");
         if (k != "") return k;
-        k = Env("OPENROUTER_API_KEY") ?? Environment.GetEnvironmentVariable("OPENROUTER_API_KEY", EnvironmentVariableTarget.User);
-        return string.IsNullOrEmpty(k) ? null : k;
+        k = Env("TYPESAFE_API_KEY") ?? Environment.GetEnvironmentVariable("TYPESAFE_API_KEY", EnvironmentVariableTarget.User);
+        if (!string.IsNullOrEmpty(k)) return k;
+        // Only when Jev was picked outright is ~/.config/jev/.env read: a file holding a secret nobody asked us to use.
+        if (JUDGE != "jev") return null;
+        string t = ReadText(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @".config\jev\.env")) ?? "";
+        Match m = Regex.Match(t, "(?m)^\\s*TYPESAFE_API_KEY\\s*=\\s*['\"]?([^'\"\\s]+)");
+        return m.Success ? m.Groups[1].Value : null;
     }
 
-    // Jev, here a model on OpenRouter (EFFORTLESS_OPENROUTER_MODEL), asked Luna's question with Luna's JSON reply.
-    // Below even odds it is unsure: Luna decides then.
-    // Nothing usable after 4 s, an error or no JSON: Luna decides too, and the person is told why once.
-    static Verdict AskJev(string key, string prompt, string current, string context, double percent)
+    class Verdict { public string Effort, Why, Down; public double? Sure; public bool Unsure; public long Tokens; }
+
+    // Jev on TypeSafe: quick, and answers with its confidence. Below even odds it is unsure: Luna decides then.
+    static Verdict AskJev(string key, string prompt, string current, string context)
     {
-        var body = Obj("model", OR_MODEL, "max_tokens", 160, "temperature", 0,
-            "messages", new object[] { Obj("role", "system", "content", JUDGE_SYSTEM), Obj("role", "user", "content", JudgeQuestion(prompt, current, context, percent)) });
-        var r = Post(OR_URL, new[] { "Authorization: Bearer " + key, "X-Title: effortless" }, Ser(body), 4);
+        var criteria = Obj("low", "quick answer, no tools, no planning", "medium", "normal work: a few tool calls or edits",
+            "high", "hard or large multi-step job: many tool calls, costly mistakes", "xhigh", "very hard: a long investigation", "max", "the hardest research-level work");
+        var body = Obj("model", "jev-latest",
+            "state", Obj("task", JEV_TASK, "current_effort", current, "recent_conversation", context, "next_message", Cut(prompt, 4000)),
+            "questions", Obj("effort", Obj("type", "choice", "instructions", "Which effort fits the next message?", "criteria", criteria)));
+        var r = Post(JEV_URL, new[] { "Authorization: Bearer " + key }, Ser(body), 3);
         if (r.Key != 200) return new Verdict { Down = JevFailure(r.Key) };
-        object j = null;
-        try { j = Parse(r.Value); } catch { }
-        object[] choices = Arr(Get(j, "choices"));
-        Verdict v = ParseVerdict(choices.Length > 0 ? Str(Get(choices[0], "message", "content")) : null);
-        if (v == null) return new Verdict { Down = "Jev 回复无法读取" };
-        v.Tokens = (long)(Num(Get(j, "usage", "prompt_tokens"), 0) + Num(Get(j, "usage", "completion_tokens"), 0));
-        if (v.Sure.HasValue && v.Sure.Value < 0.5) return new Verdict { Unsure = true, Tokens = v.Tokens };
-        return v;
+        var j = Parse(r.Value);
+        object a = Get(Get(j, "answers") ?? Get(j, "result", "answers"), "effort");
+        string effort = Str(Get(a, "choice"));
+        if (effort == null || !JUDGED.Contains(effort)) return new Verdict { Down = "Jev 回复无法读取" };
+        object sure = Get(a, "confidence") ?? Get(a, "probabilities", effort);
+        long tokens = (long)(Num(Get(j, "usage", "input_tokens"), 0) + Num(Get(j, "usage", "output_tokens"), 0));
+        if (sure != null && Num(sure, 1) < 0.5) return new Verdict { Unsure = true, Tokens = tokens };
+        return new Verdict { Effort = effort, Sure = sure != null ? Num(sure, 0) : (double?)null, Why = sure != null ? string.Format(Inv, "{0}% sure", (int)(Num(sure, 0) * 100 + 0.5)) : "", Tokens = tokens };
+    }
+    static string JevFailure(int c)
+    {
+        if (c == 0) return "Jev 没有及时回答";
+        if (c == 401 || c == 403) return "Jev 拒绝了 key（" + c + "）";
+        if (c == 402) return "Jev 额度用完了（" + c + "）";
+        if (c == 429) return "Jev 限流了（" + c + "）";
+        return "Jev 出错了（" + c + "）";
     }
 
     static Dictionary<string, object> JsonIn(string text)
@@ -754,7 +765,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     }
 
     // One prompt through the pipeline every caller shares (the hook, Auto, the bench): a level named in the prompt
-    // ("max effort") runs as asked, a follow-up keeps the effort, else Jev (when its OpenRouter key is set) and then Luna judge. With handoff
+    // ("max effort") runs as asked, a follow-up keeps the effort, else Jev (when set) and then Luna judge. With handoff
     // evidence, the handoff question goes along with Luna's.
     static Decision Decide(string prompt, string current, string lastUser, string lastAssistant, double percent, List<string> supported,
         string attachments, string handoff, bool onlyHandoff)
@@ -782,10 +793,10 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         string key = r.Action == null && JUDGE != "luna" ? JevKey() : null;
         if (key != null)
         {
-            Verdict o = AskJev(key, asked, current, context, percent);
-            r.Tokens += o.Tokens;
-            if (o.Down != null) r.Down = o.Down;
-            if (o.Effort != null) { by = "jev"; r.Raw = o.Effort; r.Sure = o.Sure; r.Why = o.Why; r.Action = "judged"; }
+            Verdict j = AskJev(key, asked, current, context);
+            r.Tokens += j.Tokens;
+            if (j.Down != null) r.Down = j.Down;
+            if (j.Effort != null) { by = "jev"; r.Raw = j.Effort; r.Sure = j.Sure; r.Why = j.Why; r.Action = "judged"; }
         }
         var jobs = new List<Job>();
         int effortJob = -1, handoffJob = -1;
@@ -816,10 +827,10 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         return r;
     }
     static string JudgeName(string b) { return b == "jev" ? "Jev" : b == "named" ? "你" : "Luna"; }
-    // The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why.
+    // The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why. Jev's reason already is its confidence.
     static string ReasonLine(string by, double? sure, string why)
     {
-        string pct = by != "named" && sure.HasValue ? string.Format(Inv, " {0}%", (int)(sure.Value * 100 + 0.5)) : "";
+        string pct = by != "named" && sure.HasValue && !(why ?? "").Contains("% sure") ? string.Format(Inv, " {0}%", (int)(sure.Value * 100 + 0.5)) : "";
         return JudgeName(by) + pct + (string.IsNullOrEmpty(why) ? "" : "：" + why);
     }
     // A confidence read back from JSON: none when it was not written or is out of range.
@@ -1199,7 +1210,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         var sb = new StringBuilder();
         sb.AppendFormat("codex-effortless {0}（{1}）\n", VERSION, Here);
         sb.AppendFormat(Inv, "设置：MODE={0} JUDGE={1} MODEL={2} MIN={3} MAX={4} BIAS={5} COLD={6}/{7}分钟 SWAMP_AT={8} HOT_AT={9} HANDOFF_FROM={10}\n", MODE, JUDGE, MODEL, MIN, MAX, BIAS, COLD, COLD_MINUTES, SWAMP_AT, HOT_AT, HANDOFF_FROM);
-        sb.Append("判断器：Codex 登录上的 " + MODEL + (JUDGE != "luna" && JevKey() != null ? "；Jev（OpenRouter 上的 " + OR_MODEL + "）先答" : "") + "\n");
+        sb.Append("判断器：Codex 登录上的 " + MODEL + (JevKey() != null ? "；Jev 先答" : "") + "\n");
         sb.Append("Auto：" + (AutoOn() ? "开" : "关（$effortless auto 打开）") + "；省钱模式：" + (Saving() ? "开" : "关") + "\n");
         string cli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
         sb.Append("Codex Desktop 的 Auto：" + (cli != null && cli.EndsWith("effortless.exe", StringComparison.OrdinalIgnoreCase) ? "开（CODEX_CLI_PATH 指向 effortless.exe）" : "关（effortless desktop on 打开）") + "\n");
@@ -1269,7 +1280,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             var re = new Regex("(?m)^\\s*" + Regex.Escape(k) + "=.*$");
             text = re.IsMatch(text) ? re.Replace(text, line.Replace("$", "$$"), 1) : text + (text == "" || text.EndsWith("\n") ? "" : "\n") + line + "\n";
             WriteText(file, text);
-            Out("已设置 " + k + "=" + (k.EndsWith("KEY") && v != "" ? "（不显示）" : v) + "\n");
+            Out("已设置 " + k + "=" + v + "\n");
             return 0;
         }
         var sb = new StringBuilder();
@@ -1431,7 +1442,7 @@ Give only the final state of anything that changed during the chat. Point to spe
         if (j == null) { Out("找不到 bench\\judge-cases.json\n"); return 1; }
         // Cases about effort relative to Claude models do not carry over to Codex models.
         var cases = Arr(Get(j, "cases")).Where(c => Str(Get(c, "kind")) != "model-relative").ToArray();
-        Out(string.Format(Inv, "{0} 个用例，判断器：{1}。每个约几秒，请稍候…\n", cases.Length, JUDGE != "luna" && JevKey() != null ? "Jev + Luna" : "Luna"));
+        Out(string.Format(Inv, "{0} 个用例，判断器：{1}。每个约几秒，请稍候…\n", cases.Length, JevKey() != null ? "Jev + Luna" : "Luna"));
         var answers = new Decision[cases.Length];
         int next = -1;
         var workers = Enumerable.Range(0, 4).Select(w => new Thread(() =>

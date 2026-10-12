@@ -77,7 +77,7 @@ line it runs is in `install.ps1` and `windows\effortless.cs`; read them, and add
 | The chat is swamped (context past 50%) | A warning naming `/compact` and `$effortless handoff`; again after 50k more tokens |
 | A 5-hour or weekly limit passes 80% | A warning with the reset time and `$effortless save`: save mode keeps Auto at medium or below until the limit resets. Said once for that limit window, in any chat, and once more at 95% |
 | A fresh chat would pay off | From 30% context, every second prompt, the judge also reads what the chat was for, the trail of topics and the last reply, and says so only for a clear reason (the task finished and the next one is different, the chat goes in circles…) |
-| The judge fails or is slow | The prompt goes on at the effort it had; a judge that keeps failing is named once per session (`判断器没有及时回答…`, `Jev 拒绝了 key（401）…`, `Jev 没有及时回答…`) |
+| The judge fails or is slow | The prompt goes on at the effort it had; a judge that keeps failing is named once per session (`判断器没有及时回答…`, `Jev 拒绝了 key（401）…`) |
 | A new version is out | Said once per session; `$effortless update` installs it |
 
 The status line (`install.sh --status-line`, or yes to the question) shows the effort in use, how full the context is
@@ -119,8 +119,7 @@ stand and wait instead of carrying on.
 | Setting | Default | Meaning |
 |---|---|---|
 | `EFFORTLESS_MODE` | `auto` | `auto` (`block` is the same), `warn` (only say, never switch or hold back, even through `codex-auto`), `off` |
-| `EFFORTLESS_JUDGE` | `auto` | `auto`: Luna, and Jev first when an OpenRouter key is set. `luna`: never Jev. `jev`: the same as `auto` |
-| `EFFORTLESS_OPENROUTER_KEY` / `_MODEL` | empty / `google/gemini-2.5-flash-lite` | Jev's OpenRouter key (or `OPENROUTER_API_KEY`) and the OpenRouter model id it runs on |
+| `EFFORTLESS_JUDGE` | `auto` | `auto`: Luna, and Jev first when a TypeSafe key is set. `luna`: never Jev. `jev`: the key may also come from `~/.config/jev/.env` |
 | `EFFORTLESS_MODEL` | `gpt-5.6-luna` | the judge model on your Codex login |
 | `EFFORTLESS_MIN` / `EFFORTLESS_MAX` | `medium` / `max` | Auto stays between these; efforts the model does not take are skipped to the nearest one it does |
 | `EFFORTLESS_BIAS` | `0` | `-2` to `2`: tips the judge's close calls cheaper or smarter; sure calls stay |
@@ -136,18 +135,16 @@ stand and wait instead of carrying on.
 Why 30 minutes for a cold cache: over this machine's Codex sessions, a prompt after up to about 20 minutes idle was
 still read almost entirely from the cache; after 45 to 60 minutes it mostly was not.
 
-## Judges: Luna, and Jev if you add it
+## Judges: Luna and Jev
 
 Luna judges on your Codex login: no key, and it goes the way your Codex goes (the same `CODEX_HOME` config and login).
 
-**Jev** runs on [OpenRouter](https://openrouter.ai) here, with an OpenRouter key where the original's Jev takes a
-TypeSafe key: set `EFFORTLESS_OPENROUTER_KEY` (or `OPENROUTER_API_KEY`) and it judges first. It gets Luna's own question
-and answers with how sure it is; when it is unsure (below even odds), fails or takes over 4 seconds, Luna decides. The model
-is `EFFORTLESS_OPENROUTER_MODEL`, by default `google/gemini-2.5-flash-lite` (fast, cheap, no thinking); pick a fast one.
-The handoff check stays with Luna, as it stays with Haiku in the original.
+**Jev** ([TypeSafe](https://typesafe.ai)) answers in well under a second with its confidence: set
+`EFFORTLESS_TYPESAFE_KEY` (or `TYPESAFE_API_KEY`) and it judges first; when it is unsure (below even odds), fails or
+takes over 3 seconds, Luna decides.
 
-The key goes only to OpenRouter, and the prompt goes there with it. On Linux the key reaches curl on stdin and the
-request body is a private file, so neither shows in the process list; on Windows it stays in memory.
+The key goes only to TypeSafe. On Linux it reaches curl on stdin and the request body is a private file, so neither
+shows in the process list; on Windows it stays in memory.
 
 ## How well it judges
 
@@ -159,14 +156,14 @@ Luna, 2026-10-10:
 |---|---|---|---|---|---|
 | Luna (Codex login) | 96% | 100% | 2 | 1 | 6.3 s |
 
-The original measured Haiku at 92 to 93% and Jev (on TypeSafe) at 99% on its 73 cases. The held-out cases were never tuned against;
+The original measured Haiku at 92 to 93% and Jev at 99% on its 73 cases. The held-out cases were never tuned against;
 70 cases is a small set and the judge is not fully deterministic, so runs differ by a few points.
 
 ## Cost and limits
 
 - A judged prompt waits for the judge: about **6 to 7 seconds** with Luna on Linux and WSL, **8 to 9** on Windows, almost
-  all of it Luna's answer; Jev answers within 4 seconds or Luna takes over. Follow-ups and named levels skip
-  the judge. About 6,000 tokens a judgement on your Codex plan.
+  all of it Luna's answer; Jev is quicker. Follow-ups and named levels skip the judge. About 6,000 tokens a judgement
+  on your Codex plan.
 - Auto and the hook read the session's transcript (effort, context, limits, messages), which is not a stable Codex
   interface.
 - In Auto, quitting the CLI prints Codex's own "To reconnect, run codex --remote …" line; the proxy is gone by then:
@@ -193,5 +190,5 @@ Each makes a few real model calls on your login and removes the test chat it mad
 
 ## License
 
-MIT. Adapted from [effortless](https://github.com/HeyCubit/effortless) (MIT, Copyright (c) 2026 HeyCubit): the judge
-and handoff prompts, the handoff format and `bench/judge-cases.json` come from it, rewritten for Codex.
+MIT. Adapted from [effortless](https://github.com/HeyCubit/effortless) (MIT, Copyright (c) 2026 HeyCubit): the judge,
+Jev and handoff prompts, the handoff format and `bench/judge-cases.json` come from it, rewritten for Codex.
