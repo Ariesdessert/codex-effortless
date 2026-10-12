@@ -25,7 +25,7 @@ use IO::Select;
 use IO::Handle;
 use Encode qw(encode_utf8 decode_utf8);
 
-our $VERSION = '0.5.0';
+our $VERSION = '0.5.1';
 my $HERE = dirname(abs_path($0));
 my $HOME = $ENV{HOME} // '';
 my $CODEX_HOME = $ENV{CODEX_HOME} || "$HOME/.codex";
@@ -79,7 +79,8 @@ my $HANDOFF_AFTER = S('EFFORTLESS_HANDOFF_AFTER', 'continue');   # continue, con
 my %HIDE = map { $_ => 1 } grep { length } split /\s*,\s*/, S('EFFORTLESS_HIDE', exists $conf{EFFORTLESS_HIDE} ? '' : 'reason');
 my $BAR = S('EFFORTLESS_BAR', 'changes');           # changes, always
 my $UPDATE_CHECK = S('EFFORTLESS_UPDATE_CHECK', 'on');
-my $CODEX = S('EFFORTLESS_CODEX', 'codex');
+my ($CODEX, $CODEX_OK) = find_codex(S('EFFORTLESS_CODEX', ''));
+my $NO_CODEX = '需要 Codex CLI，安装：curl -fsSL https://chatgpt.com/codex/install.sh | sh';
 my $DATA = S('EFFORTLESS_DATA', "$CODEX_HOME/effortless/data");
 make_path("$DATA/sessions", "$DATA/routed", "$DATA/tmp");
 my $LOG = "$DATA/verdicts.tsv";
@@ -92,6 +93,15 @@ sub rank { my $l = shift // ''; exists $RANK{$l} ? $RANK{$l} : -1 }
 # ---------------------------------------------------------------- small helpers
 
 sub trim { my $s = shift // ''; $s =~ s/^\s+|\s+$//g; $s }
+# Where codex is: the setting, then PATH, then where OpenAI's installer puts it (~/.local/bin, and the release that
+# links to). A hook, a cron job or an editor can run with a PATH that has no ~/.local/bin. Gives (command, found).
+sub find_codex {
+  my $set = shift;
+  return ($set, 1) if length $set;
+  for my $dir (split /:/, $ENV{PATH} // '') { return ('codex', 1) if length $dir && -f "$dir/codex" && -x _ }
+  for my $c ("$HOME/.local/bin/codex", "$CODEX_HOME/packages/standalone/current/bin/codex") { return ($c, 1) if -f $c && -x _ }
+  return ('codex', 0);
+}
 sub now { time() }
 sub slurp { my $p = shift; open my $f, '<:raw', $p or return undef; local $/; my $t = <$f>; $t }
 sub spew {
@@ -676,7 +686,7 @@ sub decide {
       } else {
         $r{action} = 'fail';
         $r{fail} = "$by:" . ($answers->[$effort_job] ? 'verdict' : $failed || 'turn');
-        $r{down} //= '判断器没有及时回答，档位保持不变' if !$answers->[$effort_job];
+        $r{down} //= ($CODEX_OK ? '判断器没有及时回答' : "找不到 codex，判断器没法运行（$NO_CODEX）") . '，档位保持不变' if !$answers->[$effort_job];
       }
     } else {
       $by = $judge_by;
@@ -984,8 +994,8 @@ sub cmd_debug {
   out("设置：MODE=$MODE JUDGE=$JUDGE MODEL=$MODEL MIN=$MIN MAX=$MAX BIAS=$BIAS COLD=$COLD/${COLD_MINUTES}分钟 SWAMP_AT=$SWAMP_AT HOT_AT=$HOT_AT HANDOFF_FROM=$HANDOFF_FROM\n");
   out("判断器：Codex 登录上的 $MODEL" . ($JUDGE eq 'openrouter' ? "；OpenRouter 上的 $OR_MODEL 先答" . (openrouter_key() ? '' : '（没有 key）') : jev_key() ? '；Jev 先答' : '') . "\n");
   out('Auto：' . (auto_on() ? '开' : '关（$effortless auto 打开）') . '；省钱模式：' . (saving() ? '开' : '关') . "\n");
-  my $codex = `command -v '$CODEX' 2>/dev/null`;
-  out('codex：' . (trim($codex) || "找不到 $CODEX") . "\n");
+  my $codex = $CODEX =~ m{/} ? $CODEX : `command -v '$CODEX' 2>/dev/null`;
+  out('codex：' . ($CODEX_OK && trim($codex) || "找不到。$NO_CODEX") . "\n");
   if (my $path = last_transcript()) {
     my $t = read_transcript($path);
     out(sprintf("最近对话：模型 %s，档位 %s，上下文 %s / %s（%d%%）%s\n", $t->{model} // '?', $t->{effort} // '?', ktokens($t->{tokens}), ktokens($t->{window}), $t->{percent} + 0.5,
@@ -1163,7 +1173,7 @@ sub cmd_handoff_write {
   my $answers = ask_codex([{ system => 'You read a conversation between a user and Codex, an AI coding agent, and write the handoff the user asks for.',
     ask => "$text\n\n---\n$HANDOFF_PROMPT", effort => 'medium' }], 150) // [];
   my $got = trim(($answers->[0] // {})->{text} // '');
-  $fail->($failed eq 'spawn' ? "找不到 $CODEX" : '没有及时写完') if length($got) < 100;
+  $fail->($failed eq 'spawn' || !$CODEX_OK ? "找不到 codex。$NO_CODEX" : '没有及时写完') if length($got) < 100;
   $got =~ s/^\[effortless-judge\]\s*//;
   spew("$DATA/handoff.md", encode_utf8($got) . "\n", 0600);
   unlink "$DATA/handoff-writing";
@@ -1307,6 +1317,7 @@ sub proxy_main {
     close $listener;
     { exec { $CODEX } $CODEX, '--remote', "unix://$sock_path", @args }
     print STDERR "effortless: cannot start $CODEX: $!\n";
+    print STDERR "effortless: install the Codex CLI with: curl -fsSL https://chatgpt.com/codex/install.sh | sh\n" unless $CODEX_OK;
     _exit(127);
   }
   # Ctrl+C and Ctrl+Z belong to the TUI in the foreground; the proxy stays put until it exits.
