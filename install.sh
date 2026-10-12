@@ -67,7 +67,7 @@ fi
 command -v codex >/dev/null || [ -x "$HOME/.local/bin/codex" ] || [ -x "$CODEX_HOME/packages/standalone/current/bin/codex" ] ||
   { echo "This needs the Codex CLI. Install it with: curl -fsSL https://chatgpt.com/codex/install.sh | sh"; exit 1; }
 perl -MJSON::PP -MDigest::SHA -e1 2>/dev/null || { echo "perl with JSON::PP and Digest::SHA is required (core modules)."; exit 1; }
-command -v curl >/dev/null || echo "Note: curl is not installed; only needed for Jev."
+command -v curl >/dev/null || echo "Note: curl is not installed; only needed for Jev or OpenRouter."
 
 mkdir -p "$DEST/bench" "$SKILL"
 install -m 755 "$HERE/effortless.pl" "$DEST/effortless.pl"
@@ -121,11 +121,14 @@ set_conf() { perl "$DEST/effortless.pl" config set "$1" "$2" >/dev/null; }
 if [ -z "$QUIET" ]; then
   echo
   echo "Setup (Enter keeps the choice in brackets; change any of it later with \$effortless settings):"
-  read -r -p "  Judge: 1 Luna on your Codex login, 2 add Jev (OpenRouter key) [1] " j
+  read -r -p "  Judge: 1 Luna on your Codex login, 2 add Jev (TypeSafe key), 3 add OpenRouter (OpenRouter key) [1] " j
   case ${j:-1} in
     2)
+      read -r -s -p "  TypeSafe key (not shown; saved in $CONF, readable only by you): " k; echo
+      [ -n "$k" ] && set_conf EFFORTLESS_TYPESAFE_KEY "$k" ;;
+    3)
       read -r -s -p "  OpenRouter key (not shown; saved in $CONF, readable only by you): " k; echo
-      [ -n "$k" ] && set_conf EFFORTLESS_OPENROUTER_KEY "$k" ;;
+      [ -n "$k" ] && set_conf EFFORTLESS_OPENROUTER_KEY "$k" && set_conf EFFORTLESS_JUDGE openrouter ;;
   esac
   read -r -p "  Lean: -2 cheapest … 0 balanced … 2 smartest [0] " b
   [ -n "$b" ] && set_conf EFFORTLESS_BIAS "$b"
