@@ -25,7 +25,7 @@ use IO::Select;
 use IO::Handle;
 use Encode qw(encode_utf8 decode_utf8);
 
-our $VERSION = '0.5.1';
+our $VERSION = '0.5.3';
 my $HERE = dirname(abs_path($0));
 my $HOME = $ENV{HOME} // '';
 my $CODEX_HOME = $ENV{CODEX_HOME} || "$HOME/.codex";

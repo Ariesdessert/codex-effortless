@@ -26,7 +26,7 @@ using System.Web.Script.Serialization;
 
 static class Effortless
 {
-    const string VERSION = "0.5.1";
+    const string VERSION = "0.5.3";
     static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     static readonly string[] LEVELS = { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" };
