@@ -1,12 +1,12 @@
 #!/usr/bin/env perl
-# codex-effortless for Codex on Linux, macOS and WSL. One script, only core Perl modules (and curl for Jev or OpenRouter):
+# codex-effortless for Codex on Linux, macOS and WSL. One script, only core Perl modules (and curl for Jev):
 #
 #   effortless.pl hook            the UserPromptSubmit hook (judge.sh runs this)
 #   effortless.pl codex [args]    start the Codex CLI with Auto: every prompt runs at the effort the judge picks
 #   effortless.pl stats | debug | auto [on|off] | save [on|off] | config [set KEY VALUE] | test [prompt]
 #   effortless.pl handoff-save | handoff-show | handoff-write | copy | bench | update | version
 #
-# GPT-5.6 Luna on your Codex login (or Jev on TypeSafe, or a model on OpenRouter, first when you have a key) reads each
+# GPT-5.6 Luna on your Codex login (or Jev on TypeSafe first, when you have a key) reads each
 # prompt and picks the reasoning effort. Started through `codex` above, the effort is set for the turn
 # itself; started as plain `codex`, a hook can only say which effort to pick, because Codex hooks cannot
 # set it (openai/codex#40599).
@@ -56,7 +56,7 @@ sub S {
 }
 
 my $MODE = S('EFFORTLESS_MODE', 'auto');            # auto, warn, block, off
-my $JUDGE = S('EFFORTLESS_JUDGE', 'auto');          # auto, luna, jev, openrouter
+my $JUDGE = S('EFFORTLESS_JUDGE', 'auto');          # auto, luna, jev
 my $MODEL = S('EFFORTLESS_MODEL', 'gpt-5.6-luna');
 my $MIN = S('EFFORTLESS_MIN', 'medium');
 my $MAX = S('EFFORTLESS_MAX', 'max');
@@ -64,8 +64,6 @@ my $BIAS = int(S('EFFORTLESS_BIAS', 0));
 my $BLOCK_GAP = int(S('EFFORTLESS_BLOCK_GAP', 1));
 my $BUDGET = int(S('EFFORTLESS_TIMEOUT', 20));
 my $JEV_URL = S('EFFORTLESS_JEV_URL', $ENV{JEV_URL} || 'https://api.typesafe.ai/v1/systemone');
-my $OR_URL = S('EFFORTLESS_OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions');
-my $OR_MODEL = S('EFFORTLESS_OPENROUTER_MODEL', 'google/gemini-2.5-flash-lite');
 my $SWAMP_AT = S('EFFORTLESS_SWAMP_AT', 50);
 my $COLD = S('EFFORTLESS_COLD', 'block');           # block, warn, off
 my $COLD_MINUTES = S('EFFORTLESS_COLD_MINUTES', 30);
@@ -537,32 +535,12 @@ sub ask_jev {
   return { effort => $effort, sure => $sure, why => defined $sure ? sprintf('%d%% sure', $sure * 100 + 0.5) : '', tokens => $tokens };
 }
 sub jev_failure {
-  my ($c, $name) = @_;
-  $name //= 'Jev';
-  return "$name 没有及时回答" if $c eq '000';
-  return "$name 拒绝了 key（$c）" if $c eq '401' || $c eq '403';
-  return "$name 额度用完了（$c）" if $c eq '402';
-  return "$name 限流了（$c）" if $c eq '429';
-  return "$name 出错了（$c）";
-}
-
-sub openrouter_key {
-  my $k = S('EFFORTLESS_OPENROUTER_KEY', '');
-  return $k ne '' ? $k : $ENV{OPENROUTER_API_KEY} || undef;
-}
-
-# A model on OpenRouter, asked Luna's question with Luna's JSON reply. Below even odds it is unsure: Luna decides then.
-sub ask_openrouter {
-  my ($key, $prompt, $current, $context, $percent) = @_;
-  my $body = { model => $OR_MODEL, max_tokens => 160, temperature => 0,
-    messages => [{ role => 'system', content => $JUDGE_SYSTEM }, { role => 'user', content => judge_question($prompt, $current, $context, $percent) }] };
-  my ($code, $raw) = curl_finish(curl_start($OR_URL, ["Authorization: Bearer $key", 'X-Title: effortless'], $JSON->encode($body), 4));
-  return { down => jev_failure($code, 'OpenRouter') } if $code ne '200';
-  my $j = eval { $JSON->decode($raw) } or return { down => 'OpenRouter 回复无法读取' };
-  my $v = parse_verdict(eval { $j->{choices}[0]{message}{content} }) or return { down => 'OpenRouter 回复无法读取' };
-  my $tokens = ($j->{usage}{prompt_tokens} // 0) + ($j->{usage}{completion_tokens} // 0);
-  return { unsure => 1, tokens => $tokens } if defined $v->{sure} && $v->{sure} < 0.5;
-  return { %$v, tokens => $tokens };
+  my $c = shift;
+  return 'Jev 没有及时回答' if $c eq '000';
+  return "Jev 拒绝了 key（$c）" if $c eq '401' || $c eq '403';
+  return "Jev 额度用完了（$c）" if $c eq '402';
+  return "Jev 限流了（$c）" if $c eq '429';
+  return "Jev 出错了（$c）";
 }
 
 sub parse_verdict {
@@ -635,7 +613,7 @@ sub saving {
 sub auto_on { !-e "$DATA/auto-off" }
 
 # One prompt through the pipeline every caller shares (the hook, Auto, the bench): a level named in the prompt
-# ("max effort") runs as asked, a follow-up keeps the effort, else OpenRouter or Jev (when set) and then Luna judge. With $handoff,
+# ("max effort") runs as asked, a follow-up keeps the effort, else Jev (when set) and then Luna judge. With $handoff,
 # the handoff question goes along with Luna's.
 # Gives {effort (shaped), raw, sure, why, by, ms, tokens, action, down, handoff}.
 sub decide {
@@ -658,14 +636,7 @@ sub decide {
     %r = (%r, effort => $current, raw => $current, sure => 1, why => '', action => 'follow-up');
     return \%r unless $a{handoff};
   }
-  if (!$r{action} && $JUDGE eq 'openrouter') {
-    my $okey = openrouter_key();
-    my $j = $okey ? ask_openrouter($okey, $prompt, $current, $context, $a{percent}) : { down => 'OpenRouter 没有 key' };
-    $r{tokens} += $j->{tokens} // 0;
-    $r{down} = $j->{down} if $j->{down};
-    if ($j->{effort}) { $by = 'openrouter'; %r = (%r, raw => $j->{effort}, sure => $j->{sure}, why => $j->{why}, action => 'judged') }
-  }
-  my $key = $JUDGE ne 'luna' && $JUDGE ne 'openrouter' ? jev_key() : undef;
+  my $key = $JUDGE ne 'luna' ? jev_key() : undef;
   if (!$r{action} && $key) {
     my $j = ask_jev($key, $prompt, $current, $context);
     $r{tokens} += $j->{tokens} // 0;
@@ -915,7 +886,7 @@ sub hook {
   exit 0;
 }
 
-sub judge_name { my $b = shift // q{}; $b eq q{jev} ? q{Jev} : $b eq q{openrouter} ? q{OpenRouter} : $b eq q{named} ? q{你} : q{Luna} }
+sub judge_name { my $b = shift // q{}; $b eq q{jev} ? q{Jev} : $b eq q{named} ? q{你} : q{Luna} }
 # The judge's line: who judged, how sure when it said ("Luna 82%：…"), and why. Jev's reason already is its confidence.
 sub reason_line {
   my ($by, $sure, $why) = @_;
@@ -992,7 +963,7 @@ sub cmd_stats {
 sub cmd_debug {
   out("codex-effortless $VERSION（$HERE）\n");
   out("设置：MODE=$MODE JUDGE=$JUDGE MODEL=$MODEL MIN=$MIN MAX=$MAX BIAS=$BIAS COLD=$COLD/${COLD_MINUTES}分钟 SWAMP_AT=$SWAMP_AT HOT_AT=$HOT_AT HANDOFF_FROM=$HANDOFF_FROM\n");
-  out("判断器：Codex 登录上的 $MODEL" . ($JUDGE eq 'openrouter' ? "；OpenRouter 上的 $OR_MODEL 先答" . (openrouter_key() ? '' : '（没有 key）') : jev_key() ? '；Jev 先答' : '') . "\n");
+  out("判断器：Codex 登录上的 $MODEL" . (jev_key() ? '；Jev 先答' : '') . "\n");
   out('Auto：' . (auto_on() ? '开' : '关（$effortless auto 打开）') . '；省钱模式：' . (saving() ? '开' : '关') . "\n");
   my $codex = $CODEX =~ m{/} ? $CODEX : `command -v '$CODEX' 2>/dev/null`;
   out('codex：' . ($CODEX_OK && trim($codex) || "找不到。$NO_CODEX") . "\n");
@@ -1053,7 +1024,7 @@ sub cmd_config {
     my $line = "$k=\${$k:-$v}";
     $text =~ s/^\s*\Q$k\E=.*$/$line/m or $text .= ($text =~ /\n\z/ || $text eq '' ? '' : "\n") . "$line\n";
     spew($file, $text, 0600);
-    out("已设置 $k=" . ($k =~ /KEY$/ && $v ne q{} ? q{（不显示）} : $v) . "\n");
+    out("已设置 $k=$v\n");
     return;
   }
   for my $k (sort keys %conf) { my $v = $k =~ /KEY$/ && $conf{$k} ne '' ? '（已设置，不显示）' : $conf{$k}; out("$k=$v\n") }
@@ -1198,7 +1169,7 @@ sub cmd_bench {
   my $j = read_json($file) or die "找不到 bench/judge-cases.json\n";
   # Cases about effort relative to Claude models do not carry over to Codex models.
   my @cases = grep { $_->{kind} ne 'model-relative' } @{ $j->{cases} };
-  out(sprintf("%d 个用例，判断器：%s。每个约几秒，请稍候…\n", scalar @cases, $JUDGE eq 'openrouter' && openrouter_key() ? q{OpenRouter + Luna} : $JUDGE ne 'openrouter' && jev_key() ? q{Jev + Luna} : q{Luna}));
+  out(sprintf("%d 个用例，判断器：%s。每个约几秒，请稍候…\n", scalar @cases, jev_key() ? q{Jev + Luna} : q{Luna}));
   my (@answers, %kids);
   my $par = 4;
   for my $i (0 .. $#cases) {
