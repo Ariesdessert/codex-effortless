@@ -74,7 +74,7 @@ line it runs is in `install.ps1` and `windows\effortless.cs`; read them, and add
 | No Auto, the judge wants less | `effortless: 建议 low（当前 high）— Luna 90%：reason（按 Alt+, 降 2 档，对下一条消息生效）` |
 | The chat went cold (idle 30 minutes, context of 150k tokens or more) | The first prompt is held back once: it would reread the whole chat at full price. `/compact` or hand off first, or send it again to go ahead |
 | `$effortless handoff` in a cold chat (idle 30 minutes) | Luna writes the handoff from the transcript in the background instead of the chat's model rereading it all at full price; `/new` and `$effortless resume` pick it up. Send it again to have the chat's model write it |
-| The chat is swamped (context past 50%) | A warning naming `/compact` and `$effortless handoff`; again after 50k more tokens |
+| The chat is swamped (context past 70%) | A warning naming `/compact` and `$effortless handoff`; again after 50k more tokens |
 | A 5-hour or weekly limit passes 80% | A warning with the reset time and `$effortless save`: save mode keeps Auto at medium or below until the limit resets. Said once for that limit window, in any chat, and once more at 95% |
 | A fresh chat would pay off | From 30% context, every second prompt, the judge also reads what the chat was for, the trail of topics and the last reply, and says so only for a clear reason (the task finished and the next one is different, the chat goes in circles…) |
 | The judge fails or is slow | The prompt goes on at the effort it had; a judge that keeps failing is named once per session (`判断器没有及时回答…`, `Jev 拒绝了 key（401）…`) |
@@ -104,6 +104,7 @@ Type these in Codex (CLI or Desktop); the skill runs the program for you. The sa
 | `$effortless handoff` | the quick handoff: the model writes it from what the chat shows, effortless saves it; then `/new` and `$effortless resume`. In a cold chat Luna writes it from the transcript instead |
 | `$effortless handoff full` | checks git, rewrites `HANDOFF.md`, then the same (or runs your own skill: `EFFORTLESS_HANDOFF_SKILL`) |
 | `$effortless resume` | in a fresh chat: carries on from the saved handoff |
+| `$effortless cold` / `swamp` / `hot` / `down` | shows that alert's words now, with the last chat's numbers, to see what it says |
 | `$effortless test [prompt]` | asks the judge once |
 | `$effortless bench` | scores the judge on the labelled prompts in `bench/judge-cases.json` |
 | `$effortless desktop on` / `off` | Auto in Codex Desktop (Windows) |
@@ -125,7 +126,7 @@ stand and wait instead of carrying on.
 | `EFFORTLESS_BIAS` | `0` | `-2` to `2`: tips the judge's close calls cheaper or smarter; sure calls stay |
 | `EFFORTLESS_TIMEOUT` | `20` | seconds before the prompt goes on at the effort it had |
 | `EFFORTLESS_COLD` / `_COLD_MINUTES` / `_COLD_TOKENS` | `block` / `30` / `150000` | the cold-chat check (`warn` or `off` instead of holding the prompt) |
-| `EFFORTLESS_SWAMP_AT` | `50` | percent of the context window |
+| `EFFORTLESS_SWAMP_AT` | `70` | percent of the context window |
 | `EFFORTLESS_HOT_AT` | `80` | percent of a usage limit (said once per limit window, again at 95%) |
 | `EFFORTLESS_HANDOFF_FROM` / `_EVERY` | `30` / `2` | when the judge checks whether a fresh chat would pay off (`off`: never) |
 | `EFFORTLESS_HIDE` | `reason` | parts to keep quiet: `reason` (the judge's line and how sure it was), and the alerts `swamp` (context), `hot` (running low), `cold` (cold cache). Empty (`config set EFFORTLESS_HIDE ""`) shows everything |
@@ -162,7 +163,8 @@ The original measured Haiku at 92 to 93% and Jev at 99% on its 73 cases. The hel
 ## Cost and limits
 
 - A judged prompt waits for the judge: about **6 to 7 seconds** with Luna on Linux and WSL, **8 to 9** on Windows, almost
-  all of it Luna's answer; Jev is quicker. Follow-ups and named levels skip the judge. About 6,000 tokens a judgement
+  all of it Luna's answer; Jev is quicker. Follow-ups, named levels and `$effortless` commands skip the judge; a
+  prompt that starts with a `$skill` is judged with that skill's description, since its name alone says little. About 6,000 tokens a judgement
   on your Codex plan.
 - Auto and the hook read the session's transcript (effort, context, limits, messages), which is not a stable Codex
   interface.

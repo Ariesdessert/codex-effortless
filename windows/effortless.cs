@@ -26,7 +26,7 @@ using System.Web.Script.Serialization;
 
 static class Effortless
 {
-    const string VERSION = "0.5.3";
+    const string VERSION = "0.5.4";
     static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
     static readonly string[] LEVELS = { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" };
@@ -71,7 +71,7 @@ static class Effortless
         BLOCK_GAP = I(S("EFFORTLESS_BLOCK_GAP", "1"));
         BUDGET = I(S("EFFORTLESS_TIMEOUT", "20"));
         JEV_URL = S("EFFORTLESS_JEV_URL", Env("JEV_URL") ?? "https://api.typesafe.ai/v1/systemone");
-        SWAMP_AT = D(S("EFFORTLESS_SWAMP_AT", "50"));
+        SWAMP_AT = D(S("EFFORTLESS_SWAMP_AT", "70"));
         COLD = S("EFFORTLESS_COLD", "block");
         COLD_MINUTES = D(S("EFFORTLESS_COLD_MINUTES", "30"));
         COLD_TOKENS = D(S("EFFORTLESS_COLD_TOKENS", "150000"));
@@ -412,6 +412,48 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             if (Regex.IsMatch(before, @"\b(not|no|don'?t|never|without|instead of)\b", RegexOptions.ECMAScript) || Regex.IsMatch(before, "(不要|不用|别|无需|不必)")) continue;
             string w = Regex.Replace((m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Success ? m.Groups[2].Value : "xhigh").ToLowerInvariant(), @"\s+", " ");
             return w == "x-high" || w == "extra high" || w == "extra-high" ? "xhigh" : w == "maximum" ? "max" : w;
+        }
+        return null;
+    }
+
+    // "$effortless stats" and the like: effortless's own commands, never judged.
+    static bool OwnCommand(string text) { return Regex.IsMatch(text ?? "", @"^\s*\$effortless\b", RegexOptions.IgnoreCase | RegexOptions.ECMAScript); }
+
+    class Skill { public string Name, Description; }
+    // The skill a typed "$name args" runs, or null: looked up where Codex keeps skills (yours, the system ones,
+    // ~/.agents, the project's, plugins'). A plugin's "$plugin:skill" is found by its last part.
+    static Skill TypedSkill(string text, string cwd)
+    {
+        Match m = Regex.Match(text ?? "", @"^\s*\$([A-Za-z0-9][\w.:-]*)", RegexOptions.ECMAScript);
+        if (!m.Success || m.Groups[1].Value.ToLowerInvariant() == "effortless") return null;
+        string name = m.Groups[1].Value;
+        name = name.Substring(name.LastIndexOf(':') + 1);
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var roots = new List<string> { Path.Combine(CodexHome, "skills"), Path.Combine(CodexHome, @"skills\.system"), Path.Combine(home, @".agents\skills") };
+        if (!string.IsNullOrEmpty(cwd)) { roots.Add(Path.Combine(cwd, @".agents\skills")); roots.Add(Path.Combine(cwd, @".codex\skills")); }
+        try
+        {
+            string cache = Path.Combine(CodexHome, @"plugins\cache");
+            if (Directory.Exists(cache))
+                foreach (string a in Directory.GetDirectories(cache)) foreach (string b in Directory.GetDirectories(a)) foreach (string c in Directory.GetDirectories(b))
+                    roots.Add(Path.Combine(c, "skills"));
+        }
+        catch { }
+        foreach (string root in roots)
+        {
+            string[] dirs;
+            try { dirs = Directory.Exists(root) ? Directory.GetDirectories(root) : new string[0]; } catch { continue; }
+            foreach (string dir in dirs)
+            {
+                string head = ReadText(Path.Combine(dir, "SKILL.md"));
+                if (head == null) continue;
+                Match front = Regex.Match(head.Replace("\r\n", "\n"), @"\A---\s*\n([\s\S]*?)\n---");
+                if (!front.Success) continue;
+                Match called = Regex.Match(front.Groups[1].Value, @"^name:\s*[""']?(.*?)[""']?\s*$", RegexOptions.Multiline);
+                if (!(called.Success && called.Groups[1].Value == name) && Path.GetFileName(dir) != name) continue;
+                Match what = Regex.Match(front.Groups[1].Value, @"^description:\s*[""']?(.*?)[""']?\s*$", RegexOptions.Multiline);
+                return new Skill { Name = name, Description = Cut(what.Success ? what.Groups[1].Value.Trim() : "", 400) };
+            }
         }
         return null;
     }
@@ -768,14 +810,19 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     // ("max effort") runs as asked, a follow-up keeps the effort, else Jev (when set) and then Luna judge. With handoff
     // evidence, the handoff question goes along with Luna's.
     static Decision Decide(string prompt, string current, string lastUser, string lastAssistant, double percent, List<string> supported,
-        string attachments, string handoff, bool onlyHandoff)
+        string attachments, string handoff, bool onlyHandoff, string cwd = null)
     {
         by = "-";
         var r = new Decision();
+        // effortless's own commands are never judged: the effort stays, and no handoff question goes along.
+        if (!onlyHandoff && OwnCommand(prompt)) { r.Effort = r.Raw = current; r.Why = ""; r.Action = "command"; return r; }
         var sw = Stopwatch.StartNew();
         string context = ContextText(lastUser, lastAssistant);
         string asked = prompt;
         if (!string.IsNullOrEmpty(attachments)) asked += "\n\n[The message comes with " + attachments + " to look at.]";
+        // A typed $skill: its name alone says little, so the judge is told what the skill does.
+        Skill skill = onlyHandoff ? null : TypedSkill(prompt, cwd);
+        if (skill != null) asked += "\n\n[This message runs a skill: " + (skill.Description != "" ? skill.Description : skill.Name) + " Judge the work the skill will do.]";
         string named = !onlyHandoff && !Regex.IsMatch(prompt, @"^\s*[$/]") ? NamedEffort(prompt) : null;
         if (onlyHandoff) { r.Effort = current; r.Action = "skip"; }
         else if (named != null)
@@ -846,6 +893,62 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     static string LimitName(double m) { return m == 300 ? "5 小时" : m == 10080 ? "每周" : m % 60 == 0 ? (m / 60).ToString(Inv) + " 小时" : m.ToString(Inv) + " 分钟"; }
     static Limit Hottest(Transcript t) { return t.Limits.Values.OrderByDescending(l => l.Pct).FirstOrDefault(); }
 
+    // ------------------------------------------------------------ the alerts' words (the hook and the previews share them)
+
+    // A chat gone cold; held: the prompt is held back once (COLD=block), else it is a note.
+    static string ColdText(double idle, double tokens, bool held)
+    {
+        string msg = string.Format(Inv, "effortless: 对话已冷（闲置 {0} 分钟），这条消息会按全价重读约 {1} tokens。", (int)idle, Ktokens(tokens));
+        return msg + (held ? "想省就先 /compact 或 $effortless handoff；原文还在输入框里，直接回车重发就照常发送。" : "下次闲置这么久后，先 /compact 或 $effortless handoff 更省。");
+    }
+    static string SwampText(double percent, double tokens)
+    {
+        return string.Format(Inv, "effortless: 对话臃肿 — 上下文已用 {0}%（约 {1} tokens），每条消息都要重读这些内容。可以 /compact 或 $effortless handoff。", (int)(percent + 0.5), Ktokens(tokens));
+    }
+    static string HotText(Limit top)
+    {
+        string reset = top.Resets > 0 ? "，" + ClockOf(top.Resets) + " 重置" : "";
+        string save = Saving() ? "省钱模式已开（Auto 最高 medium）。" : "输入 $effortless save 开启省钱模式：Auto 最高只到 medium，直到额度重置。";
+        return string.Format(Inv, "effortless: {0}额度已用 {1}%{2}。{3}", LimitName(top.Minutes), (int)top.Pct, reset, save);
+    }
+
+    // $effortless cold, swamp, hot, down: an alert's words now, to see it. With the last chat's numbers when there is one.
+    static int Preview(string kind)
+    {
+        string path = LastTranscript();
+        Transcript t = path != null ? ReadTranscript(path) : new Transcript();
+        var sb = new StringBuilder("预览，不是真的提醒：\n");
+        if (kind == "cold")
+        {
+            double idle = t.LastAt > 0 ? (Now() - t.LastAt) / 60 : 0;
+            if (idle < COLD_MINUTES) idle = COLD_MINUTES + 5;
+            double tokens = t.Tokens >= COLD_TOKENS ? t.Tokens : COLD_TOKENS + 30000;
+            sb.Append(ColdText(idle, tokens, COLD != "warn") + "\n");
+            sb.Append(COLD == "warn" ? "（作为提示附在回复前，消息照常发送）\n" : "（这条消息会被拦下一次）\n");
+            sb.Append(string.Format(Inv, "触发条件：闲置 {0} 分钟以上，且上下文不少于 {1} tokens。\n", COLD_MINUTES, Ktokens(COLD_TOKENS)));
+        }
+        else if (kind == "swamp")
+        {
+            double percent = t.Percent >= SWAMP_AT ? t.Percent : SWAMP_AT + 5;
+            double tokens = t.Window > 0 ? t.Window * percent / 100 : 180000;
+            sb.Append(SwampText(percent, tokens) + "\n" + string.Format(Inv, "触发条件：上下文用到 {0}% 以上，之后每多 50k tokens 再说一次。\n", SWAMP_AT));
+        }
+        else if (kind == "hot")
+        {
+            Limit top = Hottest(t) ?? new Limit { Minutes = 300 };
+            if (top.Pct < HOT_AT) top = new Limit { Minutes = top.Minutes, Resets = top.Resets, Pct = HOT_AT + 5 };
+            sb.Append(HotText(top) + "\n" + string.Format(Inv, "触发条件：任一额度用到 {0}% 以上；同一额度窗口只说一次，到 {1}% 再说一次。\n", HOT_AT, HOT_FINAL));
+        }
+        else
+        {
+            if (JevKey() != null) sb.Append("effortless: " + JevFailure(0) + "\n（Jev 出问题时：Luna 接手判断）\n");
+            sb.Append("effortless: 判断器没有及时回答，档位保持不变\n（判断器都没答上时：档位不变，消息照常发送）\n");
+        }
+        if (HIDE.Contains(kind) || (kind == "cold" && COLD == "off")) sb.Append("（这条提醒现在是关的：EFFORTLESS_HIDE 或 EFFORTLESS_COLD=off）\n");
+        Out(sb.ToString());
+        return 0;
+    }
+
     // Running hot is said once per usage window (its length and reset time), and once more when it passes HOT_FINAL.
     const double HOT_FINAL = 95;
     // To the quarter hour: the reset time Codex reports can shift by seconds between turns.
@@ -904,23 +1007,24 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         // handoff can come first; sent again (or anything else sent in the same idle spell), it goes through.
         if (cold && COLD != "off" && !HIDE.Contains("cold") && t.Tokens >= COLD_TOKENS && !SameTime(Get(st, "cold_for"), t.LastAt))
         {
-            string msg = string.Format(Inv, "effortless: 对话已冷（闲置 {0} 分钟），这条消息会按全价重读约 {1} tokens。", (int)idle, Ktokens(t.Tokens));
             if (COLD == "block")
             {
                 st["cold_for"] = t.LastAt;
                 WriteJson(stPath, st);
                 LogRow(current, "-", "-", 0, 0, "cold-block");
-                SayJson(Obj("decision", "block", "reason", msg + "想省就先 /compact 或 $effortless handoff；原文还在输入框里，直接回车重发就照常发送。"));
+                SayJson(Obj("decision", "block", "reason", ColdText(idle, t.Tokens, true)));
                 return 0;
             }
-            notes.Add(msg + "下次闲置这么久后，先 /compact 或 $effortless handoff 更省。");
+            notes.Add(ColdText(idle, t.Tokens, false));
         }
 
         var routed = ReadJson(Path.Combine(Data, "routed", sid));
         if (routed != null && Now() - Num(Get(routed, "at"), 0) >= 120) routed = null;
         double percent = t.Percent;
         string evidence = null;
-        if (HANDOFF_FROM != "off" && percent >= D(HANDOFF_FROM))
+        // effortless's own commands do not count towards the next handoff check, nor get one.
+        if (OwnCommand(prompt)) { }
+        else if (HANDOFF_FROM != "off" && percent >= D(HANDOFF_FROM))
         {
             st["since_check"] = Num(Get(st, "since_check"), 0) + 1;
             if (Num(st["since_check"], 0) >= HANDOFF_EVERY) { st["since_check"] = 0; evidence = HandoffEvidence(t.Users, t.LastAssistant, prompt, percent, cold); }
@@ -973,10 +1077,10 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             }
             else
             {
-                r = Decide(prompt, current, lastUser, t.LastAssistant, percent, info != null ? info.Supported : null, null, evidence, false);
+                r = Decide(prompt, current, lastUser, t.LastAssistant, percent, info != null ? info.Supported : null, null, evidence, false, Str(Get(p, "cwd")));
                 if (r.Down != null && once(r.Down)) notes.Add("effortless: " + r.Down);
                 string sure = r.Sure.HasValue ? r.Sure.Value.ToString("0.00", Inv) : "-";
-                if (r.Action == "follow-up") LogRow(current, "-", "-", 0, 0, "follow-up");
+                if (r.Action == "follow-up" || r.Action == "command") LogRow(current, "-", "-", 0, 0, r.Action);
                 else if (r.Action == "fail") LogRow(current, "-", "-", r.Ms, r.Tokens, "fail:" + r.Fail);
                 else
                 {
@@ -1019,7 +1123,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
         {
             if (!cold && (Get(st, "swamp_at") == null || t.Tokens >= Num(Get(st, "swamp_at"), 0) + 50000))
             {
-                notes.Add(string.Format(Inv, "effortless: 对话臃肿 — 上下文已用 {0}%（约 {1} tokens），每条消息都要重读这些内容。可以 /compact 或 $effortless handoff。", (int)(percent + 0.5), Ktokens(t.Tokens)));
+                notes.Add(SwampText(percent, t.Tokens));
                 st["swamp_at"] = t.Tokens;
             }
         }
@@ -1032,9 +1136,7 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
             string saidPath = Path.Combine(Data, "hot-said");
             if (top.Pct >= HOT_AT && !HIDE.Contains("hot") && HotVisible(top, ReadJson(saidPath)))
             {
-                string reset = top.Resets > 0 ? "，" + ClockOf(top.Resets) + " 重置" : "";
-                string save = Saving() ? "省钱模式已开（Auto 最高 medium）。" : "输入 $effortless save 开启省钱模式：Auto 最高只到 medium，直到额度重置。";
-                notes.Add(string.Format(Inv, "effortless: {0}额度已用 {1}%{2}。{3}", LimitName(top.Minutes), (int)top.Pct, reset, save));
+                notes.Add(HotText(top));
                 WriteJson(saidPath, Obj("window", HotWindow(top), "pct", top.Pct));
             }
         }
@@ -1292,7 +1394,8 @@ Reply with JSON only: {""handoff"":""reason of at most 8 words, in the person's 
     static int TestCmd(string[] a)
     {
         string prompt = a.Length > 0 ? string.Join(" ", a) : "rename one variable in a single file";
-        Decision r = Decide(prompt, "medium", null, null, 0, null, null, null, false);
+        Decision r = Decide(prompt, "medium", null, null, 0, null, null, null, false, Environment.CurrentDirectory);
+        if (r.Action == "command") { Out("effortless 自己的命令，不判断，档位保持 " + r.Effort + "\n"); return 0; }
         if (r.Action == "judged" || r.Action == "named") { Out(string.Format(Inv, "{0} 回答：{1}（{2}，{3:0.0} 秒）{4}\n", JudgeName(r.By), r.Effort, r.Sure.HasValue ? string.Format(Inv, "{0:0}% 把握", r.Sure.Value * 100) : "没说把握", r.Ms / 1000.0, r.Why != "" ? " — " + r.Why : "")); return 0; }
         Out("判断失败：" + (r.Fail ?? r.Action) + (r.Down != null ? "（" + r.Down + "）" : "") + "\n");
         return 1;
@@ -1657,11 +1760,12 @@ Give only the final state of anything that changed during the chat. Point to spe
             var held = new Held { Message = m, Tid = tid, Current = current, Model = model, Settings = settings != null, File = routedFile };
             judging.Add(held);
             string lastUser = s.LastUser, lastAssistant = s.LastAssistant, attachments = InputAttachments(input);
+            string cwd = Str(Get(prm, "cwd")) ?? Environment.CurrentDirectory;
             var supported = new List<string>(info.Supported);
             new Thread(() =>
             {
                 Decision d;
-                try { Session = SafeId(tid); d = Decide(text, current, lastUser, lastAssistant, 0, supported, attachments, null, false); }
+                try { Session = SafeId(tid); d = Decide(text, current, lastUser, lastAssistant, 0, supported, attachments, null, false, cwd); }
                 catch { d = new Decision { Action = "fail", Fail = "error" }; }
                 Finish(held, d);
             }) { IsBackground = true }.Start();
@@ -1972,6 +2076,7 @@ Give only the final state of anything that changed during the chat. Point to spe
                 case "hook": return Hook();
                 case "stats": case "--stats": return Stats();
                 case "debug": return DebugInfo();
+                case "cold": case "swamp": case "hot": case "down": return Preview(cmd);
                 case "auto": return AutoCmd(arg1 ?? "toggle");
                 case "save": return SaveCmd(arg1 ?? "toggle");
                 case "config": return ConfigCmd(rest);

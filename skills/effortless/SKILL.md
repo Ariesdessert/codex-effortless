@@ -1,6 +1,6 @@
 ---
 name: effortless
-description: codex-effortless commands. Use when the user types $effortless (stats, debug, auto, save, settings, handoff, handoff full, resume, bench, update, desktop) or asks about effortless, its Auto effort, its alerts or a handoff to a fresh chat.
+description: codex-effortless commands. Use when the user types $effortless (stats, debug, auto, save, settings, handoff, handoff full, resume, cold, swamp, hot, down, bench, update, desktop) or asks about effortless, its Auto effort, its alerts or a handoff to a fresh chat.
 metadata:
   short-description: Auto effort, stats, save mode, settings and handoffs
 ---
@@ -30,6 +30,7 @@ short line each.
 | `$effortless save` / `save on` / `save off` | `save` ...: save mode keeps Auto at medium or below until the usage limit resets |
 | `$effortless settings` | `config`, then offer to change any of them |
 | `$effortless set KEY VALUE` | `config set EFFORTLESS_KEY VALUE` (add the `EFFORTLESS_` prefix if missing) |
+| `$effortless cold` / `swamp` / `hot` / `down` | `cold`, `swamp`, `hot` or `down`: shows that alert's words now, to see what it says |
 | `$effortless test [prompt]` | `test [prompt]`: asks the judge once |
 | `$effortless bench` | `bench`: scores the judge on labelled prompts (a few minutes; say so first) |
 | `$effortless update` | `update` |
